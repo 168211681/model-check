@@ -3,6 +3,31 @@
   "name": "Sign in google",
   "createdAt": "2026-10-23T06:48:09.949Z",
   "filename": "b279ac55-f6a9-43b1-a2b3-5379802d79e8.json",
-  "geminiStarted": false,
-  "messages": []
+  "geminiStarted": true,
+  "messages": [
+    {
+      "id": "982e58fe-d4bb-4118-a2fb-7915f6dbc91a",
+      "role": "user",
+      "content": "Model check",
+      "status": "pending",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-10-23T08:06:00.104Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "4c3f37f2-dc54-443b-be77-e107f8e1d166",
+      "role": "agent",
+      "content": "I am running on **Gemini 4 Argon** (Medium). How can I help you today?",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "982e58fe-d4bb-4118-a2fb-7915f6dbc91a",
+      "created_at": "2026-10-23T08:06:07.531Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    }
+  ]
 }
