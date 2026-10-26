@@ -2,6 +2,11 @@ name: "VEDA G1.5 App Supervisor synthetic sandbox (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g15-process-supervisor.yml
 
 permissions:
   contents: read
@@ -51,8 +56,9 @@ jobs:
           test "$(git -C verify-source rev-parse HEAD)" = "$GITHUB_SHA"
           test -r verify-source/tools/veda_g15_process_supervisor.py
           test -r verify-source/tools/veda_g15_supervisor_qa.py
-          python3 -S -m py_compile verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py
-          sha256sum verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py
+          test -r verify-source/tools/veda_g15_escape_group_negative_qa.py
+          python3 -S -m py_compile verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py verify-source/tools/veda_g15_escape_group_negative_qa.py
+          sha256sum verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py verify-source/tools/veda_g15_escape_group_negative_qa.py
 
       - name: Generate Seccomp BPF and restricted launcher
         shell: bash
@@ -155,6 +161,7 @@ jobs:
           chmod 0755 "$stage"
           cp verify-source/tools/veda_g15_process_supervisor.py "$stage/"
           cp verify-source/tools/veda_g15_supervisor_qa.py "$stage/"
+          cp verify-source/tools/veda_g15_escape_group_negative_qa.py "$stage/"
           chmod 0644 "$stage"/*.py
           printf 'VEDA_G15_STAGE=%s\n' "$stage" >> "$GITHUB_ENV"
           test -s "$RUNNER_TEMP/g13-seccomp.bpf"
@@ -181,6 +188,18 @@ jobs:
             echo '| cgroup v2 process-tree enforcement | HOLD / not tested |'
             echo '| Trust G0 | HOLD unchanged |'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce detached-child subreaper regression gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VEDA_G15_STAGE"
+          timeout 30s sudo --non-interactive /usr/bin/python3 \
+            "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+            "$VEDA_G15_STAGE" "$(readlink /proc/self/ns/net)" \
+            /usr/bin/python3 -S /tmp/work/veda_g15_escape_group_negative_qa.py
+          echo "G1.5 ESCAPE REGRESSION GATE PASS: detached descendant detected and terminated"
+          echo "| Detached process-group escape cleanup | PASS |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout pinned upstream llama.cpp without checkout action
         shell: bash
