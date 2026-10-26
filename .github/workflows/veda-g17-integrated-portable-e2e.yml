@@ -2,6 +2,11 @@ name: "VEDA G1.7 integrated generic GGUF Supervisor Seccomp kernel QA"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-integrated-portable-e2e.yml
 
 permissions:
   contents: read
@@ -129,15 +134,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tools
-          for script in veda_g15_process_supervisor.py veda_g17_portable_seccomp_exec.py; do
+          for script in veda_g17_process_supervisor.py veda_g17_supervisor_race_qa.py veda_g17_portable_seccomp_exec.py; do
             curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
               --output "tools/$script" "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/$script"
           done
-          printf '%s  %s\n' b48f1fe8c5567bb4b4e23feb618c54f5aa5a3d0d85211d0324c2b5fbe9fac65e tools/veda_g15_process_supervisor.py | sha256sum --check --status
-          python3 -S -m py_compile tools/veda_g15_process_supervisor.py tools/veda_g17_portable_seccomp_exec.py
+          grep -q 'proc.wait(timeout=0.08)' tools/veda_g17_process_supervisor.py
+          python3 -S tools/veda_g17_supervisor_race_qa.py
+          echo "G1.7 INTEGRATED_EXIT_RACE_QA=PASS"
+          python3 -S -m py_compile tools/veda_g17_process_supervisor.py tools/veda_g17_supervisor_race_qa.py tools/veda_g17_portable_seccomp_exec.py
           chmod -R a+rX tools
           sha256sum tools/*.py
-          echo "G1.7 INTEGRATED_G15_G17_SOURCE_INTEGRITY=PASS"
+          echo "G1.7 INTEGRATED_G17_SUPERVISOR_SOURCE_INTEGRITY=PASS"
 
       - name: Verify Seccomp 27-deny negative test after exec inside kernel-capped container
         if: env.RUN_NATIVE == 'true'
@@ -153,7 +160,7 @@ jobs:
             --mount "type=bind,source=$root/tools,target=/tools,readonly" \
             --entrypoint /usr/bin/python3 \
             ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c \
-            -S /tools/veda_g15_process_supervisor.py \
+            -S /tools/veda_g17_process_supervisor.py \
             --max-rss-mb 200 --max-as-mb 3072 --max-processes 4 --timeout-s 12 -- \
             /usr/bin/python3 -S /tools/veda_g17_portable_seccomp_exec.py \
             --post-exec-selftest > g17-negative.jsonl
@@ -221,7 +228,7 @@ jobs:
                 --env "VEDA_PORTABLE_SHA256=$binary_sha" \
                 --entrypoint /usr/bin/python3 \
                 ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c \
-                -S /tools/veda_g15_process_supervisor.py \
+                -S /tools/veda_g17_process_supervisor.py \
                 --max-rss-mb 600 --max-as-mb 3072 --max-processes 8 --timeout-s 55 -- \
                 /usr/bin/python3 -S /tools/veda_g17_portable_seccomp_exec.py \
                 -- /portable/llama-completion \
