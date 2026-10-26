@@ -2,6 +2,11 @@ name: "VEDA G1.7 Portable GGUF Unified Security E2E"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-unified-portable-e2e.yml
 
 permissions:
   contents: read
@@ -125,7 +130,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for filename in veda_g15_process_supervisor.py veda_g16_seccomp_exec.py; do
+          for filename in veda_g17_process_supervisor.py veda_g17_supervisor_race_qa.py veda_g16_seccomp_exec.py; do
             curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
               --output "portable/$filename" "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/$filename"
           done
@@ -133,7 +138,11 @@ jobs:
             --output g17-security-runner.py "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/veda_g17_unified_portable_runner.py"
           test -s g17-security-runner.py
           sha256sum g17-security-runner.py
-          python3 -S -m py_compile g17-security-runner.py
+          test "$(git hash-object portable/veda_g17_process_supervisor.py)" = 1838bf72b07286741dd2ac7899706b71feda4dcc
+          test "$(git hash-object portable/veda_g17_supervisor_race_qa.py)" = fdc124233642a6b68c452399ebfd696b459303e7
+          python3 -S -m py_compile g17-security-runner.py portable/veda_g17_process_supervisor.py portable/veda_g17_supervisor_race_qa.py
+          python3 -S portable/veda_g17_supervisor_race_qa.py
+          echo "G1.7 SUPERVISOR_EXIT_RACE_REGRESSION_GATE=PASS"
           python3 -S g17-security-runner.py \
             --portable portable --model model/model.gguf \
             --job "${{ matrix.host }}-${{ matrix.slot }}" \
