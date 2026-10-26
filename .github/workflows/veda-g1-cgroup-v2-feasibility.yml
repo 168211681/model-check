@@ -1,0 +1,112 @@
+name: "VEDA G1.5 cgroup v2 read-only feasibility (model-check only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-cgroup-v2-feasibility.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g15-cgroup-v2-feasibility
+  cancel-in-progress: false
+
+jobs:
+  cgroup-v2-read-only:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify free standard runner and restricted scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RUNNER_OS" = "Linux"
+          test "$RUNNER_ARCH" = "X64"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          echo "G1.5 scope PASS: public model-check, Ubuntu standard runner, read-only token."
+          echo "No sudo, no cgroup writes, no deploy, no canonical changes."
+
+      - name: Inspect cgroup v2 and delegation without modifying anything
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          root = pathlib.Path("/sys/fs/cgroup")
+          def read(path):
+              try:
+                  return pathlib.Path(path).read_text(encoding="utf-8").strip()
+              except (OSError, UnicodeError):
+                  return None
+
+          mountinfo = read("/proc/self/mountinfo") or ""
+          mounts = []
+          for line in mountinfo.splitlines():
+              parts = line.split()
+              if " - " in line and len(parts) >= 10:
+                  left, right = line.split(" - ", 1)
+                  fs_type = right.split()[0] if right.split() else ""
+                  if fs_type == "cgroup2":
+                      mounts.append(left.split()[4])
+          mounted = "/sys/fs/cgroup" in mounts
+          membership = read("/proc/self/cgroup") or ""
+          unified_paths = [x[3:] for x in membership.splitlines() if x.startswith("0::")]
+          if unified_paths:
+              path = unified_paths[0]
+              current = (root / path.lstrip("/")).resolve()
+          else:
+              current = root
+          within_root = current == root or root in current.parents
+          current_ok = within_root and current.is_dir()
+          base = current if current_ok else root
+          available = read(base / "cgroup.controllers")
+          if available is None:
+              available = read(root / "cgroup.controllers")
+          controllers = sorted((available or "").split())
+          subtree = (read(base / "cgroup.subtree_control") or "").split()
+          cpu = read(base / "cpu.max")
+          memory = read(base / "memory.max")
+          pids = read(base / "pids.max")
+          # os.access is a non-mutating capability hint, NOT proof of delegation.
+          hints = {
+              "parent_directory_writable": os.access(base, os.W_OK),
+              "subtree_control_writable": os.access(base / "cgroup.subtree_control", os.W_OK),
+              "cgroup_procs_writable": os.access(base / "cgroup.procs", os.W_OK),
+              "memory_controller_available": "memory" in controllers,
+              "pids_controller_available": "pids" in controllers,
+              "cpu_controller_available": "cpu" in controllers,
+          }
+          candidate = mounted and current_ok and all(hints.values())
+          status = "POSSIBLE_UNVERIFIED" if candidate else "NO_SAFE_DELEGATION_EVIDENCE"
+          print("CGROUP_V2_MOUNT_PRESENT=" + str(mounted))
+          print("CGROUP_V2_CURRENT_RESOLVABLE=" + str(current_ok))
+          print("CGROUP_V2_CONTROLLERS=" + (",".join(controllers) or "none"))
+          print("CGROUP_V2_SUBTREE_ENABLED=" + (",".join(subtree) or "none"))
+          print("CGROUP_V2_CPU_MAX=" + str(cpu or "unavailable"))
+          print("CGROUP_V2_MEMORY_MAX=" + str(memory or "unavailable"))
+          print("CGROUP_V2_PIDS_MAX=" + str(pids or "unavailable"))
+          for key, value in hints.items():
+              print("CGROUP_V2_HINT_" + key.upper() + "=" + str(value))
+          print("CGROUP_V2_DELEGATION=" + status)
+          print("CGROUP_V2_NO_WRITE_PROBE=CONFIRMED")
+          print("G1.5 READ-ONLY FEASIBILITY COMPLETE")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("## VEDA G1.5: cgroup v2 read-only feasibility\n")
+              out.write("| Check | Result |\n|---|---|\n")
+              out.write(f"| Unified cgroup v2 mounted | {mounted} |\n")
+              out.write(f"| Process cgroup path visible | {current_ok} |\n")
+              out.write(f"| Controllers reported | {', '.join(controllers) or 'none'} |\n")
+              out.write(f"| Delegation write-access hint | {status} |\n")
+              out.write("| Probe actually created or changed cgroups | No |\n")
+              out.write("| Trust G0 | HOLD, unchanged |\n")
+              out.write("\nWrite-access hints are not confirmation of safe delegation.\n")
+          PY
