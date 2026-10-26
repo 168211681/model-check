@@ -2,6 +2,11 @@ name: "VEDA G1.5 Synthetic RLIMIT QA (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-rlimit-synthetic.yml
 
 permissions:
   contents: read
