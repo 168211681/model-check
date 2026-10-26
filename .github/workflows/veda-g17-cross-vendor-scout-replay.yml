@@ -1,0 +1,166 @@
+name: "VEDA G1.7 One-build cross-vendor scout and gated replay"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-cross-vendor-scout-replay.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g17-cross-vendor-scout
+  cancel-in-progress: false
+
+jobs:
+  single-portable-build:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Build pinned portable CPU binary exactly once
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          for command in cmake ninja git gcc g++ sha256sum tar; do command -v "$command"; done
+          git init -q src
+          git -C src remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C src fetch --depth 1 origin 224d94c02b502470071921da10e8bcee1160d539
+          git -C src checkout -q --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = 224d94c02b502470071921da10e8bcee1160d539
+          cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_CPU_REPACK=OFF \
+            -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_AVX512=OFF \
+            -DGGML_AVX_VNNI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF \
+            -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_SSE42=OFF -DGGML_BMI2=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          for flag in GGML_NATIVE GGML_CPU_ALL_VARIANTS GGML_AVX GGML_AVX2 GGML_AVX512 GGML_FMA GGML_F16C GGML_SSE42 GGML_BMI2; do
+            grep -q "^$flag:BOOL=OFF$" src/build/CMakeCache.txt
+          done
+          cmake --build src/build --target llama-completion --parallel 3
+          test -x src/build/bin/llama-completion
+          tar -C src/build/bin -czf veda-g17-cpu-generic.tar.gz .
+          sha256sum veda-g17-cpu-generic.tar.gz > veda-g17-cpu-generic.tar.gz.sha256
+          echo "G1.7 SAME_BINARY_GENERATION=PASS"
+          sha256sum src/build/bin/llama-completion
+          echo "G1.7 TRUST_G0=HOLD"
+
+      - name: Upload immutable single-build artifact with 1-day retention
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: veda-g17-portable-onebuild
+          path: |
+            veda-g17-cpu-generic.tar.gz
+            veda-g17-cpu-generic.tar.gz.sha256
+          retention-days: 1
+          if-no-files-found: error
+
+  replay-on-two-host-images:
+    if: github.repository == '168211681/model-check'
+    needs: single-portable-build
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-24.04, ubuntu-22.04]
+        slot: [1, 2, 3, 4]
+    runs-on: "${{ matrix.host }}"
+    timeout-minutes: 9
+    env:
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+    steps:
+      - name: Download exact uploaded CPU-generic binary, not a rebuild
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: veda-g17-portable-onebuild
+          path: artifact
+
+      - name: CPU vendor gate before model download and inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          vendor="$(awk -F: '/^vendor_id/{gsub(/^[ \t]+/,"",$2); print $2;exit}' /proc/cpuinfo)"
+          cpu="$(awk -F: '/^model name/{gsub(/^[ \t]+/,"",$2); print $2;exit}' /proc/cpuinfo)"
+          test -n "$vendor"
+          echo "G1.7 HARDWARE_VENDOR=$vendor"
+          echo "G1.7 HARDWARE_CPU=$cpu"
+          echo "G1.7 HOST_LABEL=${{ matrix.host }}"
+          echo "G1.7 HOST_SLOT=${{ matrix.slot }}"
+          # Prioritize Intel while keeping one positive AMD baseline per host image.
+          if test "$vendor" = GenuineIntel || test "${{ matrix.slot }}" = 1; then
+            echo "RUN_NATIVE=true" >> "$GITHUB_ENV"
+            echo "G1.7 CPU_GENERIC_SELECTED=YES"
+          else
+            echo "RUN_NATIVE=false" >> "$GITHUB_ENV"
+            echo "G1.7 CPU_GENERIC_SELECTED=NO_AMD_SCOUT_ONLY"
+          fi
+          echo "G1.7 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.7 TRUST_G0=HOLD"
+
+      - name: Verify artifact, CPU and pinned GGUF
+        if: env.RUN_NATIVE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          for command in docker curl tar sha256sum; do command -v "$command" >/dev/null; done
+          (cd artifact && sha256sum -c veda-g17-cpu-generic.tar.gz.sha256)
+          mkdir -p portable model
+          tar -xzf artifact/veda-g17-cpu-generic.tar.gz -C portable
+          test -x portable/llama-completion
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 --output model/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" model/model.gguf | sha256sum --check --status
+          chmod -R a+rX portable model
+          echo "G1.7 HOST_OS=$RUNNER_OS"
+          echo "G1.7 CPU_VENDOR=$(awk -F: '/^vendor_id/{print $2;exit}' /proc/cpuinfo)"
+          echo "G1.7 CPU_MODEL=$(awk -F: '/^model name/{print $2;exit}' /proc/cpuinfo)"
+          echo "G1.7 SAME_BINARY_ARCHIVE_SHA256=$(sha256sum artifact/veda-g17-cpu-generic.tar.gz | awk '{print $1}')"
+          echo "G1.7 SAME_BINARY_EXE_SHA256=$(sha256sum portable/llama-completion | awk '{print $1}')"
+          echo "G1.7 MODEL_INTEGRITY=PASS"
+
+      - name: Compare identical binary in networkless capped containers
+        if: env.RUN_NATIVE == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$PWD"
+          for threads in 1 2; do
+            for trial in 1 2; do
+              timeout 65s docker run --rm --network none \
+                --memory 768m --memory-swap 768m --pids-limit 48 \
+                --cap-drop ALL --security-opt no-new-privileges \
+                --user 65534:65534 --read-only \
+                --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+                --mount "type=bind,source=$root/portable,target=/portable,readonly" \
+                --mount "type=bind,source=$root/model,target=/model,readonly" \
+                --env LD_LIBRARY_PATH=/portable \
+                --entrypoint /portable/llama-completion \
+                ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c \
+                --model /model/model.gguf \
+                --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+                --n-predict 24 --ctx-size 256 --threads "$threads" --threads-batch "$threads" \
+                --temp 0 --seed 42 --no-display-prompt --no-conversation \
+                > "inference-$threads-$trial.out" 2> "inference-$threads-$trial.err"
+              test -s "inference-$threads-$trial.out"
+              grep -q Paris "inference-$threads-$trial.out"
+              printf "G1.7 REPLAY_THREADS_%s_TRIAL_%s_SHA256=" "$threads" "$trial"
+              sha256sum "inference-$threads-$trial.out" | awk '{print $1}'
+            done
+            cmp "inference-$threads-1.out" "inference-$threads-2.out"
+            echo "G1.7 REPLAY_THREADS_$threads=REPRODUCIBLE_WITHIN_HOST"
+          done
+          echo "G1.7 SINGLE_COMPILED_BINARY_CROSS_HOST_REPLAY=PASS_PER_HOST"
+          echo "G1.7 CROSS_CPU_VENDOR_DETERMINISM=AWAIT_COMPARISON_OF_JOB_LOGS"
+          echo "G1.7 GATED_REPLAY_COMPLETED=PASS"
+          echo "G1.7 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.7 TRUST_G0=HOLD"
