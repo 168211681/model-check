@@ -2,6 +2,11 @@ name: "VEDA G1.6 Unified Supervisor Seccomp Kernel GGUF E2E"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-unified-supervisor-seccomp-kernel-gguf.yml
 
 permissions:
   contents: read
@@ -121,6 +126,7 @@ jobs:
           initial_oom="$(awk '$1=="oom_kill"{print $2}' /sys/fs/cgroup/memory.events)"
           initial_pids="$(awk '$1=="max"{print $2}' /sys/fs/cgroup/pids.events)"
           for attempt in 1 2; do
+            set +e
             /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
               --max-rss-mb 600 --max-as-mb 3072 --max-processes 8 --timeout-s 55 -- \
               /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g16_seccomp_exec.py \
@@ -130,6 +136,13 @@ jobs:
               --n-predict 24 --ctx-size 256 --threads 2 \
               --temp 0 --seed 42 --no-display-prompt --no-conversation \
               > "/tmp/veda_g16_combined/native-$attempt.jsonl"
+            supervisor_exit=$?
+            set -e
+            if test "$supervisor_exit" -ne 0; then
+              echo "G1.6 UNIFIED_FAIL_CLOSED_SUPERVISOR_EXIT=$supervisor_exit"
+              grep '^VEDA_SUPERVISOR_RESULT=' "/tmp/veda_g16_combined/native-$attempt.jsonl"                 || head -c 1400 "/tmp/veda_g16_combined/native-$attempt.jsonl"
+              exit "$supervisor_exit"
+            fi
             /usr/bin/python3 -S - "/tmp/veda_g16_combined/native-$attempt.jsonl" "$attempt" <<'PY'
           import json, os, sys
           from pathlib import Path
