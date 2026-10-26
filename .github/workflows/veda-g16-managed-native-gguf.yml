@@ -2,6 +2,11 @@ name: "VEDA G1.6 Managed Kernel GGUF Runtime E2E (synthetic, nonroot)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-managed-native-gguf.yml
 
 permissions:
   contents: read
@@ -16,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     container:
-      image: ghcr.io/ggml-org/llama.cpp:light
+      image: ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c
       options: >-
         --memory=768m
         --memory-swap=768m
@@ -113,6 +118,7 @@ jobs:
           echo "G1.6 NATIVE_PIDS_MAX_DELTA=0"
           echo "G1.6 ROOTLESS_DELEGATION_E2E=NOT_RUN"
           echo "G1.6 TRUST_G0=HOLD"
+          if test -n "${GITHUB_STEP_SUMMARY:-}" && test -w "$GITHUB_STEP_SUMMARY"; then
           {
             echo '## VEDA G1.6 Managed Kernel + Native GGUF'
             echo '| Gate | Result |'
@@ -128,6 +134,9 @@ jobs:
             echo '| Rootless delegated subtree | NOT TESTED |'
             echo '| Trust G0 | HOLD |'
           } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "G1.6 STEP_SUMMARY_NONROOT_PERMISSION=SKIPPED_LOGS_ARE_EVIDENCE"
+          fi
 
       - name: Always report constrained scope
         if: always()
