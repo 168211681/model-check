@@ -111,6 +111,18 @@ def _negative_control() -> None:
 
 
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--verify-inherited":
+        # This process has already exec'd a fresh Python interpreter after the
+        # parent installed seccomp. We must not load another filter here.
+        _check_nonroot()
+        assert _status().get("Seccomp") == "2", "seccomp did not survive execve"
+        _negative_control()
+        print("G1.6 SECCOMP_PERSISTED_ACROSS_EXEC=PASS", flush=True)
+        return 0
+    if len(sys.argv) == 2 and sys.argv[1] == "--post-exec-selftest":
+        install_policy()
+        os.execv(sys.executable, [sys.executable, "-S", __file__, "--verify-inherited"])
+        return 1
     if len(sys.argv) == 2 and sys.argv[1] == "--negative-control":
         install_policy()
         _negative_control()
