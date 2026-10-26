@@ -2,6 +2,11 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          if test "$GITHUB_EVENT_NAME" = push; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -65,6 +73,7 @@ jobs:
               "request_key", "kexec_load", "finit_module", "init_module",
               "delete_module", "process_vm_readv", "process_vm_writev",
               "userfaultfd", "open_by_handle_at", "reboot", "swapon", "swapoff",
+              "io_uring_setup", "io_uring_enter", "io_uring_register", "pidfd_getfd",
           )
           # Default-ALLOW + explicit high-risk denial; not a full syscall allowlist.
           ctx = lib.seccomp_init(0x7FFF0000)
@@ -113,6 +122,19 @@ jobs:
               "--chdir", "/tmp/work",
               "--", *cmd
           ]
+          # Limits are inherited by bubblewrap and the GGUF child. Fail closed on error.
+          # RLIMIT_AS is virtual address space, not a total host memory cgroup.
+          import resource
+          limits = {
+              resource.RLIMIT_CPU: 90,
+              resource.RLIMIT_AS: 3 * 1024 * 1024 * 1024,
+              resource.RLIMIT_FSIZE: 8 * 1024 * 1024,
+              resource.RLIMIT_NOFILE: 256,
+              resource.RLIMIT_NPROC: 128,
+              resource.RLIMIT_CORE: 0,
+          }
+          for key, value in limits.items():
+              resource.setrlimit(key, (value, value))
           os.execv("/usr/bin/bwrap", args)
           PY
           /usr/bin/python3 "$RUNNER_TEMP/g13-filter.py" "$RUNNER_TEMP/g13-seccomp.bpf"
@@ -139,7 +161,7 @@ jobs:
           fi
           echo "G1.3 SECCOMP PREFLIGHT PASS"
 
-      - name: Seccomp denial and sandbox isolation negative tests
+      - name: G1.4 Seccomp, resource limits and isolation negative tests
         shell: bash
         run: |
           set -euo pipefail
@@ -181,7 +203,39 @@ jobs:
           else:
               sock.close()
               raise AssertionError("socket syscall unexpectedly permitted")
-          print("G1.3 SECURITY PASS: seccomp=2, socket() EPERM, caps=0, blocked egress, ro mounts, isolated netns")
+          # Validate resource ceilings were installed before executing bubblewrap.
+          import resource
+          ceilings = {
+              resource.RLIMIT_CPU: 90,
+              resource.RLIMIT_AS: 3 * 1024 * 1024 * 1024,
+              resource.RLIMIT_FSIZE: 8 * 1024 * 1024,
+              resource.RLIMIT_NOFILE: 256,
+              resource.RLIMIT_NPROC: 128,
+              resource.RLIMIT_CORE: 0,
+          }
+          for kind, expected in ceilings.items():
+              actual = resource.getrlimit(kind)
+              assert actual == (expected, expected), f"resource ceiling mismatch {kind}: {actual}"
+          # socketpair is a distinct syscall from socket and must be rejected.
+          try:
+              sock1, sock2 = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+          except OSError as exc:
+              assert exc.errno == errno.EPERM, f"socketpair not denied by seccomp: {exc}"
+          else:
+              sock1.close()
+              sock2.close()
+              raise AssertionError("socketpair syscall unexpectedly permitted")
+          # x86_64 io_uring_setup(425) is denied even with the kernel feature present.
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.argtypes = [ctypes.c_long, ctypes.c_uint, ctypes.c_void_p]
+          libc.syscall.restype = ctypes.c_long
+          ctypes.set_errno(0)
+          result = libc.syscall(425, 1, None)
+          assert result == -1 and ctypes.get_errno() == errno.EPERM, \
+              f"io_uring_setup syscall unexpectedly available: return={result}, errno={ctypes.get_errno()}"
+          print("G1.4 SECURITY PASS: 27 syscall denials; socket/socketpair/io_uring EPERM; CPU, AS, file, fd, proc and core limits installed")
+
           PY
           chmod 0644 "$VEDA_STAGE/g13_probe.py"
           timeout 20s sudo --non-interactive /usr/bin/python3 \
