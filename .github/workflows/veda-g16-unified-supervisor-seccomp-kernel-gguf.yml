@@ -2,6 +2,11 @@ name: "VEDA G1.6 Unified Supervisor Seccomp Kernel GGUF E2E"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-unified-supervisor-seccomp-kernel-gguf.yml
 
 permissions:
   contents: read
@@ -23,6 +28,8 @@ jobs:
         --pids-limit=48
         --cap-drop=ALL
         --security-opt=no-new-privileges
+        --read-only
+        --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
         --user=65534:65534
     env:
       MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
@@ -51,6 +58,33 @@ jobs:
           test -x /app/llama-completion
           test -x /usr/bin/python3
           test -r /usr/lib/x86_64-linux-gnu/libseccomp.so.2
+          /usr/bin/python3 -S - <<'PY'
+          import errno, os, stat
+          from pathlib import Path
+          mounts={}
+          for line in Path("/proc/self/mountinfo").read_text().splitlines():
+              fields=line.split()
+              if len(fields)>5:
+                  mounts[fields[4]]=fields[5].split(",")
+          assert "/" in mounts and "ro" in mounts["/"], f"BLOCKED: root mount not read-only: {mounts.get('/')}"
+          assert "/tmp" in mounts, "BLOCKED: /tmp not separate tmpfs"
+          for attr in ("rw", "nodev", "nosuid", "noexec"):
+              assert attr in mounts["/tmp"], f"BLOCKED: /tmp missing mount option {attr}: {mounts['/tmp']}"
+          marker=Path("/tmp/veda_g16_noexec_canary.sh")
+          marker.write_text("#!/bin/sh\nexit 0\n")
+          marker.chmod(0o700)
+          pid=os.fork()
+          if pid==0:
+              try: os.execv(str(marker),[str(marker)])
+              except OSError as exc:
+                  os._exit(0 if exc.errno in (errno.EACCES,errno.EPERM) else 21)
+              os._exit(22)
+          _,st=os.waitpid(pid,0)
+          marker.unlink()
+          assert os.WIFEXITED(st) and os.WEXITSTATUS(st)==0, f"BLOCKED: /tmp allowed native exec: {st}"
+          print("G1.6 UNIFIED_READONLY_ROOT=PASS",flush=True)
+          print("G1.6 UNIFIED_TMPFS_NOEXEC=PASS",flush=True)
+          PY
           echo "G1.6 UNIFIED_SCOPE=PASS"
           echo "G1.6 UNIFIED_KERNEL_MEMORY_MAX=805306368"
           echo "G1.6 UNIFIED_KERNEL_PIDS_MAX=48"
