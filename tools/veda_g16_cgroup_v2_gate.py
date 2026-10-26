@@ -63,6 +63,11 @@ def _mount_is_cgroup2() -> bool:
 def inspect(parent: Path, current: Path | None = None, real: bool = True) -> dict:
     """Only reads metadata. False access hints always deny; true is not proof."""
     failures = []
+    requested_parent = parent
+    # Resolve for scope checks, but explicitly reject a symlink alias that
+    # could otherwise conceal an unexpected delegated subtree.
+    if requested_parent.is_symlink():
+        failures.append("PARENT_SYMLINK_NOT_ALLOWED")
     parent = parent.resolve(strict=False)
     if real:
         mounted = _mount_is_cgroup2()
@@ -73,6 +78,8 @@ def inspect(parent: Path, current: Path | None = None, real: bool = True) -> dic
             failures.append("NOT_A_NONROOT_CGROUP_SUBTREE")
         if parent != current and parent not in current.parents:
             failures.append("NOT_OWN_PROCESS_ANCESTOR")
+        if parent == current:
+            failures.append("PARENT_EQUALS_CURRENT_CGROUP")
         # A writable-looking path may still be on a read-only cgroup2 mount.
         # Only an owned, already-delegated nonroot subtree is eligible.
         try:
@@ -88,8 +95,14 @@ def inspect(parent: Path, current: Path | None = None, real: bool = True) -> dic
         current = current.resolve(strict=False)
         if parent != current and parent not in current.parents:
             failures.append("NOT_OWN_PROCESS_ANCESTOR")
+        if parent == current:
+            failures.append("PARENT_EQUALS_CURRENT_CGROUP")
     if not parent.is_dir() or parent.is_symlink():
         failures.append("PARENT_NOT_DIRECTORY")
+    # Domain controllers such as memory require an empty non-root parent.
+    # Never move the runner's own process to "fix" a populated parent.
+    if _read(parent / "cgroup.procs"):
+        failures.append("PARENT_HAS_INTERNAL_PROCESSES")
     controllers = set(_read(parent / "cgroup.controllers").split())
     enabled = set(_read(parent / "cgroup.subtree_control").split())
     for kind in ("memory", "pids"):
@@ -271,10 +284,12 @@ def selftest() -> dict:
         base = Path(temp)
         candidate = base / "scope"
         candidate.mkdir()
+        leaf = candidate / "runner"
+        leaf.mkdir()
         (candidate / "cgroup.controllers").write_text("memory pids cpu")
         (candidate / "cgroup.subtree_control").write_text("memory pids")
         (candidate / "cgroup.procs").write_text("")
-        allowed = inspect(candidate, current=candidate, real=False)
+        allowed = inspect(candidate, current=leaf, real=False)
         assert allowed["decision"] == "ELIGIBLE_UNVERIFIED", allowed
         (candidate / "cgroup.subtree_control").write_text("cpu")
         denied = inspect(candidate, current=candidate, real=False)
@@ -284,9 +299,16 @@ def selftest() -> dict:
         wrong = inspect(candidate, current=base / "outside", real=False)
         assert wrong["decision"] == "BLOCKED"
         assert "NOT_OWN_PROCESS_ANCESTOR" in wrong["reasons"]
+        populated = inspect(candidate, current=candidate, real=False)
+        assert "PARENT_EQUALS_CURRENT_CGROUP" in populated["reasons"]
+        (candidate / "cgroup.procs").write_text("4321\n")
+        busy = inspect(candidate, current=leaf, real=False)
+        assert "PARENT_HAS_INTERNAL_PROCESSES" in busy["reasons"]
     return {"selftest": "PASS", "cases": ["already-delegated-capability-hint",
                                         "missing-subtree-controllers-fail-closed",
-                                        "wrong-parent-fail-closed"]}
+                                        "wrong-parent-fail-closed",
+                                        "parent-equals-current-denied",
+                                        "populated-parent-denied"]}
 
 
 def main() -> int:
