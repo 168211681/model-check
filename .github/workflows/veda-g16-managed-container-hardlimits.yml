@@ -1,0 +1,132 @@
+name: "VEDA G1.6 managed-container kernel hard limits (synthetic)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-managed-container-hardlimits.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g16-managed-kernel
+  cancel-in-progress: false
+
+jobs:
+  managed-container-kernel-e2e:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    container:
+      image: python:3.12-slim-bookworm
+      options: >-
+        --memory=256m
+        --memory-swap=256m
+        --pids-limit=24
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --user=65534:65534
+    steps:
+      - name: Confirm nonroot cgroup2 kernel limits, no writes
+        shell: sh
+        run: |
+          set -eu
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          cg=Path("/sys/fs/cgroup")
+          mounts=Path("/proc/self/mountinfo").read_text()
+          assert any(" - cgroup2 " in line and line.split()[4]=="/sys/fs/cgroup" for line in mounts.splitlines()), "BLOCKED: missing cgroup v2"
+          assert os.geteuid()==65534 and os.getegid()==65534, "BLOCKED: nonroot user missing"
+          mem=cg.joinpath("memory.max").read_text().strip()
+          pids=cg.joinpath("pids.max").read_text().strip()
+          assert mem==str(256*1024*1024),f"BLOCKED: unexpected memory.max {mem}"
+          assert pids=="24",f"BLOCKED: unexpected pids.max {pids}"
+          with open("/proc/self/status") as f:
+              proc={line.split(":",1)[0]:line.split(":",1)[1].strip() for line in f if ":" in line}
+          assert proc["CapEff"]=="0000000000000000", "BLOCKED: effective capabilities present"
+          assert proc["NoNewPrivs"]=="1", "BLOCKED: privilege escalation not disabled"
+          print("G1.6 MANAGED_PREFLIGHT=PASS")
+          print("G1.6 KERNEL_MEMORY_MAX="+mem)
+          print("G1.6 KERNEL_PIDS_MAX="+pids)
+          print("G1.6 NO_CGROUP_WRITES=CONFIRMED")
+          print("G1.6 ROOTLESS_DELEGATION=NOT_TESTED")
+          print("G1.6 TRUST_G0=HOLD")
+          PY
+
+      - name: Verify kernel pids.max denial with fixed process count
+        shell: sh
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os,errno,signal,time
+          from pathlib import Path
+          ev=Path("/sys/fs/cgroup/pids.events")
+          def maxevt(): return int(dict(line.split() for line in ev.read_text().splitlines()).get("max","0"))
+          before=maxevt()
+          children=[]
+          rejected=False
+          try:
+              for i in range(28):
+                  try: pid=os.fork()
+                  except OSError as exc:
+                      if exc.errno!=errno.EAGAIN: raise
+                      rejected=True
+                      break
+                  if pid==0:
+                      time.sleep(1)
+                      os._exit(0)
+                  children.append(pid)
+          finally:
+              for pid in children:
+                  try: os.kill(pid,signal.SIGKILL)
+                  except ProcessLookupError: pass
+              for pid in children: os.waitpid(pid,0)
+          after=maxevt()
+          assert rejected and after>before,f"BLOCKED: pids.max unproven EAGAIN={rejected}, counters={before}->{after}"
+          print(f"G1.6 MANAGED_PIDS_KERNEL_PASS: EAGAIN, max_delta={after-before}")
+          PY
+
+      - name: Verify kernel memory.max denial with bounded 384MiB worker
+        shell: sh
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os,time
+          from pathlib import Path
+          ev=Path("/sys/fs/cgroup/memory.events")
+          def events(): return {k:int(v) for k,v in (line.split() for line in ev.read_text().splitlines())}
+          before=events()
+          pid=os.fork()
+          if pid==0:
+              try:
+                  block=bytearray(384*1024*1024)
+                  for i in range(0,len(block),4096): block[i]=1
+                  time.sleep(0.25)
+                  os._exit(33)
+              except MemoryError: os._exit(34)
+          _,status=os.waitpid(pid,0)
+          after=events()
+          mx=after.get("max",0)-before.get("max",0)
+          oom=after.get("oom",0)-before.get("oom",0)
+          kill=after.get("oom_kill",0)-before.get("oom_kill",0)
+          stopped=os.WIFSIGNALED(status) or (os.WIFEXITED(status) and os.WEXITSTATUS(status)==34)
+          assert stopped and mx>0 and (oom>0 or kill>0),f"BLOCKED: memory.max unproven stop={stopped}, max={mx}, oom={oom}, kill={kill}"
+          print(f"G1.6 MANAGED_MEMORY_KERNEL_PASS: max_delta={mx}, oom_delta={oom}, oom_kill_delta={kill}")
+          print("G1.6 MANAGED_CONTAINER_KERNEL_E2E=PASS")
+          print("G1.6 ROOTLESS_DELEGATION_E2E=NOT_RUN")
+          print("G1.6 TRUST_G0=HOLD")
+          PY
+
+      - name: End-of-test scope
+        if: always()
+        shell: sh
+        run: |
+          echo "Managed standard runner container, no sudo, no host Docker socket."
+          echo "No direct cgroup writes, no Production or Canonical Source changes."
+          echo "Rootless delegation untested; Trust G0 HOLD."
