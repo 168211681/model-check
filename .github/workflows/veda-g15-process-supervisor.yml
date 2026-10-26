@@ -2,6 +2,11 @@ name: "VEDA G1.5 App Supervisor synthetic sandbox (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g15-process-supervisor.yml
 
 permissions:
   contents: read
@@ -247,7 +252,7 @@ jobs:
               "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
               "$VEDA_G15_STAGE" "$(readlink /proc/self/ns/net)" \
               /usr/bin/python3 -S /tmp/work/veda_g15_process_supervisor.py \
-              --max-rss-mb 768 --max-processes 2 --timeout-s 45 -- \
+              --max-rss-mb 768 --max-as-mb 3072 --max-processes 2 --timeout-s 45 -- \
               /tmp/work/bin/llama-completion \
               --model /tmp/work/native-model.gguf \
               --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
@@ -279,6 +284,7 @@ jobs:
             echo '|---|---|'
             echo '| Pinned llama.cpp and verified GGUF | PASS |'
             echo '| Supervisor + Seccomp inference x2 | PASS |'
+            echo '| Per-process kernel RLIMIT_AS | 3072 MiB, virtual address space only |'
             echo '| Deterministic output matches G1.4 | PASS |'
             echo '| Group cleanup | PASS |'
             echo '| Kernel cgroup v2 memory/pids enforcement | HOLD |'
