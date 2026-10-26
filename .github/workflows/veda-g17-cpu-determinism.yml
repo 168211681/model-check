@@ -2,6 +2,11 @@ name: "VEDA G1.7 CPU determinism cross-run diagnostics"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-cpu-determinism.yml
 
 permissions:
   contents: read
@@ -145,7 +150,7 @@ jobs:
           chmod 0400 /tmp/veda_g16_combined/model.gguf
           echo "G1.6 UNIFIED_PINNED_GGUF=PASS"
 
-          - name: Log CPU family, feature subset, and pinned binary
+      - name: Log CPU family, feature subset, and pinned binary
         shell: bash
         run: |
           set -euo pipefail
@@ -227,7 +232,7 @@ jobs:
           echo "G1.7 ROOTLESS_NAMESPACE=BLOCKED"
           echo "G1.7 TRUST_G0=HOLD"
 
-  - name: Always report governance hold and container boundaries
+      - name: Always report governance hold and container boundaries
         if: always()
         shell: bash
         run: |
