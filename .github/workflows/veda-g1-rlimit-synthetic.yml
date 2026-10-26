@@ -1,0 +1,226 @@
+name: "VEDA G1.5 Synthetic RLIMIT QA (model-check only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-rlimit-synthetic.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g15-rlimit-synthetic
+  cancel-in-progress: false
+
+jobs:
+  synthetic-rlimits:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Verify scope, standard runner, and read-only token
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          echo "G1.5 SCOPE PASS: standard Ubuntu x64 / no repository write / no paid services"
+          echo "G1.5 CGROUP WRITES: NONE. RLIMIT tests are per-process, not cgroup-v2 enforcement."
+
+      - name: Install signed Bubblewrap package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          test -x /usr/bin/bwrap
+
+      - name: Prepare synthetic negative and positive RLIMIT probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d -p /tmp veda-g15-rlimit.XXXXXX)"
+          chmod 0755 "$stage"
+          printf 'VEDA_G15_STAGE=%s\n' "$stage" >> "$GITHUB_ENV"
+          cat > "$stage/rlimit_synthetic.py" <<'PY'
+          import errno
+          import hashlib
+          import os
+          import pathlib
+          import resource
+          import signal
+          import subprocess
+          import sys
+
+          MiB = 1024 * 1024
+
+          def require(value, message):
+              if not value:
+                  raise AssertionError(message)
+
+          if len(sys.argv) == 2 and sys.argv[1] != "harness":
+              mode = sys.argv[1]
+              if mode == "as":
+                  resource.setrlimit(resource.RLIMIT_AS, (128 * MiB, 128 * MiB))
+                  import mmap
+                  try:
+                      obj = mmap.mmap(-1, 512 * MiB)
+                  except (OSError, MemoryError) as exc:
+                      if isinstance(exc, OSError):
+                          require(exc.errno == errno.ENOMEM, f"unexpected mmap errno: {exc}")
+                      print("RLIMIT_AS PASS: synthetic virtual mmap rejected with ENOMEM")
+                  else:
+                      obj.close()
+                      raise AssertionError("oversized virtual allocation unexpectedly succeeded")
+              elif mode == "fsize":
+                  resource.setrlimit(resource.RLIMIT_FSIZE, (1 * MiB, 1 * MiB))
+                  signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+                  dest = pathlib.Path("/tmp/g15-synthetic-limit.bin")
+                  try:
+                      try:
+                          with dest.open("wb") as f:
+                              f.write(b"x" * (MiB + 4096))
+                      except OSError as exc:
+                          require(exc.errno == errno.EFBIG, f"unexpected write errno: {exc}")
+                          print("RLIMIT_FSIZE PASS: oversized tmpfs output rejected with EFBIG")
+                      else:
+                          raise AssertionError("oversized file unexpectedly created")
+                  finally:
+                      dest.unlink(missing_ok=True)
+              elif mode == "nofile":
+                  resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
+                  opened = []
+                  try:
+                      try:
+                          for _ in range(256):
+                              opened.append(os.open("/dev/null", os.O_RDONLY))
+                      except OSError as exc:
+                          require(exc.errno == errno.EMFILE, f"unexpected fd errno: {exc}")
+                          print("RLIMIT_NOFILE PASS: file descriptor limit enforced")
+                      else:
+                          raise AssertionError("exceeded fd ceiling")
+                  finally:
+                      for fd in opened:
+                          os.close(fd)
+              elif mode == "nproc":
+                  require(os.geteuid() == 65534, "NPROC needs nonroot test uid")
+                  resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
+                  try:
+                      pid = os.fork()
+                  except OSError as exc:
+                      require(exc.errno == errno.EAGAIN, f"unexpected fork errno: {exc}")
+                      print("RLIMIT_NPROC PASS: fork() rejected by per-real-UID limit")
+                  else:
+                      if pid == 0:
+                          os._exit(0)
+                      os.waitpid(pid, 0)
+                      raise AssertionError("fork unexpectedly succeeded under NPROC=1")
+              elif mode == "cpu":
+                  resource.setrlimit(resource.RLIMIT_CPU, (1, 2))
+                  def cpu_limit_handler(signum, frame):
+                      print("RLIMIT_CPU PASS: SIGXCPU received after bounded CPU use", flush=True)
+                      sys.exit(0)
+                  signal.signal(signal.SIGXCPU, cpu_limit_handler)
+                  state = 0
+                  while True:
+                      state = (state + 1) % 100000
+              elif mode == "core":
+                  resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+                  require(resource.getrlimit(resource.RLIMIT_CORE) == (0, 0), "core limit wrong")
+                  print("RLIMIT_CORE PASS: core-dump size ceiling is zero")
+              elif mode == "positive":
+                  limits = [
+                      (resource.RLIMIT_AS, 256 * MiB),
+                      (resource.RLIMIT_FSIZE, MiB),
+                      (resource.RLIMIT_NOFILE, 64),
+                      (resource.RLIMIT_NPROC, 64),
+                      (resource.RLIMIT_CPU, 5),
+                      (resource.RLIMIT_CORE, 0),
+                  ]
+                  for kind, value in limits:
+                      resource.setrlimit(kind, (value, value))
+                      require(resource.getrlimit(kind) == (value, value), "positive ceiling mismatch")
+                  data = b"VEDA G1.5 deterministic synthetic control; no private content"
+                  expected = hashlib.sha256(data).hexdigest()
+                  require(len(expected) == 64, "invalid digest")
+                  print(f"RLIMIT_POSITIVE PASS: bounded workload SHA256={expected}")
+              else:
+                  raise ValueError(f"unrecognized test: {mode}")
+              sys.exit(0)
+
+          # Tests run inside a new, network-isolated bubblewrap namespace as UID nobody.
+          require(os.geteuid() == 65534 and os.getegid() == 65534, "user not dropped")
+          require(not os.path.lexists("/home") and not os.path.lexists("/root"), "host paths exposed")
+          require(os.path.exists("/tmp/work/rlimit_synthetic.py"), "stage not readable")
+          require("GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ, "secret environment exposed")
+          tests = ("as", "fsize", "nofile", "nproc", "cpu", "core", "positive", "positive")
+          positive_hashes = []
+          for test in tests:
+              completed = subprocess.run(
+                  [sys.executable, "/tmp/work/rlimit_synthetic.py", test],
+                  text=True, capture_output=True, timeout=7, check=False,
+              )
+              if completed.returncode != 0:
+                  print(f"RLIMIT TEST FAIL: {test}: return={completed.returncode}")
+                  print(completed.stdout[-800:])
+                  print(completed.stderr[-800:])
+                  sys.exit(1)
+              lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+              require(any(x.startswith("RLIMIT_") and " PASS:" in x for x in lines),
+                      f"test {test} did not emit PASS evidence")
+              print(completed.stdout.strip(), flush=True)
+              if test == "positive":
+                  positives = [x.split("SHA256=")[1] for x in lines if "SHA256=" in x]
+                  require(len(positives) == 1, "positive digest absent")
+                  positive_hashes.extend(positives)
+          require(len(positive_hashes) == 2 and positive_hashes[0] == positive_hashes[1],
+                  "positive result not reproducible within isolated sandbox")
+          print("G1.5 SYNTHETIC RLIMIT QA PASS: 6 negative/ceiling probes, two deterministic controls")
+          print("LIMITATION: these are per-process/per-real-UID limits, NOT cgroup process-tree memory enforcement")
+          PY
+          chmod 0644 "$stage/rlimit_synthetic.py"
+          /usr/bin/python3 -m py_compile "$stage/rlimit_synthetic.py"
+          echo "G1.5 static Python syntax check PASS"
+
+      - name: Execute synthetic RLIMIT probes in disposable sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VEDA_G15_STAGE"
+          timeout 75s sudo --non-interactive bwrap --unshare-all --die-with-parent \
+            --new-session --cap-drop ALL --tmpfs / \
+            --ro-bind /usr /usr \
+            --symlink usr/bin /bin --symlink usr/lib /lib \
+            --symlink usr/lib64 /lib64 \
+            --dev /dev --proc /proc --tmpfs /tmp \
+            --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+            --ro-bind "$VEDA_G15_STAGE" /tmp/work \
+            --uid 65534 --gid 65534 --clearenv \
+            --setenv HOME /tmp --chdir /tmp/work \
+            /usr/bin/python3 /tmp/work/rlimit_synthetic.py harness
+          echo "G1.5 SYNTHETIC SANDBOX COMPLETE"
+          {
+            echo '## VEDA G1.5 Synthetic RLIMIT QA'
+            echo '| Check | Result |'
+            echo '|---|---|'
+            echo '| Virtual address space, output file size, open descriptors | Tested |'
+            echo '| Process-per-UID ceiling, CPU time, core dump | Tested |'
+            echo '| Positive deterministic control, 2/2 | Tested |'
+            echo '| cgroup v2 delegation / process tree memory | BLOCKED, not tested |'
+            echo '| Trust G0 | HOLD, unchanged |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final scope evidence
+        if: always()
+        shell: bash
+        run: |
+          echo "REPO: $GITHUB_REPOSITORY"
+          echo "TEST: synthetic-only RLIMIT, no GGUF or sensitive data"
+          echo "CGROUP: read-only by policy; no creation, delegation, limits or writes"
+          echo "WORKFLOW: scope model-check only, no merges, deploys or Canonical Source changes"
