@@ -2,6 +2,11 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          if test "$GITHUB_EVENT_NAME" = push; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -144,6 +152,7 @@ jobs:
           chmod -R a+rX "$VEDA_STAGE"
           test -x "$VEDA_STAGE/bin/llama-completion"
           test -r "$VEDA_STAGE/native-model.gguf"
+          semantic_fail=0
           for attempt in 1 2; do
             output="$RUNNER_TEMP/veda-native-output-$attempt.txt"
             diagnostics="$RUNNER_TEMP/veda-native-diagnostics-$attempt.txt"
@@ -155,7 +164,7 @@ jobs:
               --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
               /tmp/work/bin/llama-completion \
               --model /tmp/work/native-model.gguf \
-              --prompt "The capital of France is" \
+              --prompt $'Capital city quiz:\\nGermany: Berlin\\nItaly: Rome\\nSpain: Madrid\\nFrance:' \
               --n-predict 24 --ctx-size 256 --threads 2 \
               --temp 0 --seed 42 --no-display-prompt --no-conversation \
               >"$output" 2>"$diagnostics"
@@ -167,29 +176,44 @@ jobs:
               exit "$status"
             fi
             test -s "$output"
-            if ! grep -Eiq '(^|[^[:alpha:]])Paris([^[:alpha:]]|$)' "$output"; then
-              echo "SEMANTIC FAIL: expected Paris in the model response (attempt $attempt)"
+            if grep -Eiq '(^|[^[:alpha:]])Paris([^[:alpha:]]|$)' "$output"; then
+              echo "SEMANTIC PASS (attempt $attempt): Paris was generated, not present in prompt"
+            else
+              echo "SEMANTIC FAIL (attempt $attempt): Paris absent"
               head -c 220 "$output"
-              exit 1
+              printf '\\n'
+              semantic_fail=1
             fi
-            echo "Native attempt $attempt semantic PASS; bytes: $(wc -c < "$output")"
+            echo "Native attempt $attempt bytes: $(wc -c < "$output")"
             sha256sum "$output"
           done
-          if ! cmp -s "$RUNNER_TEMP/veda-native-output-1.txt" "$RUNNER_TEMP/veda-native-output-2.txt"; then
-            echo "REPRODUCIBILITY FAIL: output differs despite deterministic settings"
-            exit 1
+          if cmp -s "$RUNNER_TEMP/veda-native-output-1.txt" "$RUNNER_TEMP/veda-native-output-2.txt"; then
+            echo "REPRODUCIBILITY PASS: output bytes identical 2/2"
+            reproduce_result=PASS
+          else
+            echo "REPRODUCIBILITY FAIL: outputs differ despite deterministic settings"
+            reproduce_result=FAIL
           fi
-          echo "NATIVE GGUF HARDENING PASS: semantic=Paris, reproducibility=identical 2/2, sandbox=isolated"
+          if test "$semantic_fail" -eq 0; then
+            semantic_result=PASS
+          else
+            semantic_result=FAIL
+          fi
           {
             echo '## VEDA G1 Native GGUF Hardening (model-check only)'
             echo '| Check | Result |'
             echo '|---|---|'
             echo '| Isolated bubblewrap sandbox | PASS |'
             echo '| Model SHA-256 | PASS |'
-            echo '| Semantic answer: Paris | PASS |'
-            echo '| Deterministic outputs (2/2) | PASS |'
+            echo "| Semantic answer: Paris (not given in prompt) | $semantic_result |"
+            echo "| Deterministic outputs (2/2) | $reproduce_result |"
             echo '| Trust G0 | HOLD (unchanged) |'
           } >> "$GITHUB_STEP_SUMMARY"
+          if test "$semantic_result" != PASS || test "$reproduce_result" != PASS; then
+            echo "QUALITY GATE FAIL: semantic=$semantic_result reproducibility=$reproduce_result"
+            exit 1
+          fi
+          echo "NATIVE GGUF HARDENING PASS: semantic=$semantic_result reproducibility=$reproduce_result sandbox=isolated"
 
       - name: Report reproducibility pins (even on failure)
         if: always()
