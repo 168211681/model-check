@@ -1,0 +1,75 @@
+name: "VEDA G1.6 user namespace feasibility - nonroot read-only"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-userns-feasibility.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g16-userns-readonly
+  cancel-in-progress: false
+
+jobs:
+  rootless-userns-readonly:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    container:
+      image: ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c
+      options: >-
+        --memory=768m
+        --memory-swap=768m
+        --pids-limit=48
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --user=65534:65534
+    steps:
+      - name: Validate exact container boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = '168211681/model-check'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$(id -u)" = 65534
+          test "$(id -g)" = 65534
+          test "$(cat /sys/fs/cgroup/memory.max)" = 805306368
+          test "$(cat /sys/fs/cgroup/pids.max)" = 48
+          test "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = 0000000000000000
+          test "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = 1
+          test ! -r /var/run/docker.sock
+          test ! -w /var/run/docker.sock
+          command -v unshare
+          echo "G1.6 USERNS_PREFLIGHT=PASS"
+          echo "G1.6 G0=HOLD"
+
+      - name: Try an unprivileged user namespace only, no changes to the parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -r /proc/sys/kernel/unprivileged_userns_clone; then
+            echo "G1.6 UNPRIVILEGED_USERNS_SYSCTL=$(cat /proc/sys/kernel/unprivileged_userns_clone)"
+          fi
+          if test -r /proc/sys/user/max_user_namespaces; then
+            echo "G1.6 USERNS_LIMIT=$(cat /proc/sys/user/max_user_namespaces)"
+          fi
+          set +e
+          result="$(timeout 5s unshare --user --map-root-user -- sh -c 'test "$(id -u)" = 0 && echo USERNS_CHILD_OK' 2>&1)"
+          code=$?
+          set -e
+          if test "$code" -eq 0 && printf '%s' "$result" | grep -q USERNS_CHILD_OK; then
+            echo "G1.6 USERNS_NONROOT_PROBE=PASS"
+          else
+            echo "G1.6 USERNS_NONROOT_PROBE=BLOCKED"
+            echo "G1.6 USERNS_RETURN_CODE=$code"
+            printf 'G1.6 USERNS_DETAIL=%s\n' "$result"
+          fi
+          echo "G1.6 BUBBLEWRAP_AVAILABLE=$(if command -v bwrap >/dev/null 2>&1; then echo YES; else echo NO; fi)"
+          echo "G1.6 NO_SUDO_NO_PRIVILEGE_NO_CGROUP_WRITES=CONFIRMED"
+          echo "G1.6 USERNS_BUBBLEWRAP_GATE=HOLD_UNTIL_REAL_DELEGATION"
+          echo "G1.6 TRUST_G0=HOLD"
