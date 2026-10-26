@@ -23,6 +23,8 @@ class GateSecurityTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.scope = self.root / "delegated"
         self.scope.mkdir()
+        self.leaf = self.scope / "runner"
+        self.leaf.mkdir()
         (self.scope / "cgroup.controllers").write_text("cpu io memory pids")
         (self.scope / "cgroup.subtree_control").write_text("memory pids")
         (self.scope / "cgroup.procs").write_text("")
@@ -64,6 +66,29 @@ class GateSecurityTests(unittest.TestCase):
             wrong_result = gate.inspect(self.scope, current=self.root, real=True)
         self.assertIn("NOT_A_NONROOT_CGROUP_SUBTREE", root_result["reasons"])
         self.assertIn("NOT_OWN_PROCESS_ANCESTOR", wrong_result["reasons"])
+
+    def test_eligible_synthetic_parent_is_empty_and_ancestor(self):
+        result = gate.inspect(self.scope, current=self.leaf, real=False)
+        self.assertEqual(result["decision"], "ELIGIBLE_UNVERIFIED")
+        # Synthetic fixture only. This does not prove kernel enforcement.
+
+    def test_parent_is_current_cgroup_must_fail_closed(self):
+        result = gate.inspect(self.scope, current=self.scope, real=False)
+        self.assertEqual(result["decision"], "BLOCKED")
+        self.assertIn("PARENT_EQUALS_CURRENT_CGROUP", result["reasons"])
+
+    def test_nonroot_domain_parent_with_internal_processes_denied(self):
+        (self.scope / "cgroup.procs").write_text("1234\\n")
+        result = gate.inspect(self.scope, current=self.leaf, real=False)
+        self.assertEqual(result["decision"], "BLOCKED")
+        self.assertIn("PARENT_HAS_INTERNAL_PROCESSES", result["reasons"])
+
+    def test_symlink_alias_for_parent_is_denied(self):
+        alias = self.root / "alias-parent"
+        alias.symlink_to(self.scope, target_is_directory=True)
+        result = gate.inspect(alias, current=self.leaf, real=False)
+        self.assertEqual(result["decision"], "BLOCKED")
+        self.assertIn("PARENT_SYMLINK_NOT_ALLOWED", result["reasons"])
 
     def test_missing_enabled_controllers_are_blocked(self):
         (self.scope / "cgroup.subtree_control").write_text("cpu")
