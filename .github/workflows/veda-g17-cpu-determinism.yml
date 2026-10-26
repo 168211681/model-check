@@ -2,6 +2,11 @@ name: "VEDA G1.7 CPU determinism cross-run diagnostics"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-cpu-determinism.yml
 
 permissions:
   contents: read
