@@ -1,0 +1,143 @@
+name: "VEDA G1.6 Managed Kernel GGUF Runtime E2E (synthetic, nonroot)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-managed-native-gguf.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g16-managed-native-e2e
+  cancel-in-progress: false
+
+jobs:
+  managed-native-inference:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    container:
+      image: ghcr.io/ggml-org/llama.cpp:light
+      options: >-
+        --memory=768m
+        --memory-swap=768m
+        --pids-limit=48
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --user=65534:65534
+    env:
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+      G14_BASELINE_SHA256: d7a3611195b24f1246701c68beaa1a3a641b4b759607a45bb837b36294461c53
+      LD_LIBRARY_PATH: /app
+    steps:
+      - name: Verify kernel limits and nonroot security boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(id -u)" = 65534
+          test "$(id -g)" = 65534
+          test "$(cat /sys/fs/cgroup/memory.max)" = 805306368
+          test "$(cat /sys/fs/cgroup/pids.max)" = 48
+          test "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = 0000000000000000
+          test "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = 1
+          test ! -r /var/run/docker.sock
+          test ! -w /var/run/docker.sock
+          test -x /app/llama-completion
+          command -v curl
+          command -v sha256sum
+          echo "G1.6 NATIVE_MANAGED_PREFLIGHT=PASS"
+          echo "G1.6 KERNEL_MEMORY_MAX=805306368"
+          echo "G1.6 KERNEL_PIDS_MAX=48"
+          echo "G1.6 DOCKER_SOCKET_UNAVAILABLE_TO_NONROOT=PASS"
+          echo "G1.6 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.6 TRUST_G0=HOLD"
+          /app/llama-completion --version 2>&1 | head -n 12 || true
+
+      - name: Download and verify pinned Apache-2.0 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/veda_g16_native
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 \
+            --output /tmp/veda_g16_native/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" /tmp/veda_g16_native/model.gguf | sha256sum --check --status
+          test "$(stat -c %s /tmp/veda_g16_native/model.gguf)" -gt 10000000
+          chmod 0400 /tmp/veda_g16_native/model.gguf
+          echo "G1.6 NATIVE_MODEL_SHA256_VERIFIED=$MODEL_SHA256"
+
+      - name: Reproducible native GGUF inference under live kernel memory and pids caps
+        shell: bash
+        run: |
+          set -euo pipefail
+          C=/sys/fs/cgroup
+          initial_oom="$(awk '$1=="oom_kill"{print $2}' "$C/memory.events")"
+          initial_pids="$(awk '$1=="max"{print $2}' "$C/pids.events")"
+          for attempt in 1 2; do
+            timeout 65s /app/llama-completion \
+              --model /tmp/veda_g16_native/model.gguf \
+              --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+              --n-predict 24 --ctx-size 256 --threads 2 \
+              --temp 0 --seed 42 --no-display-prompt --no-conversation \
+              >"/tmp/veda_g16_native/output-$attempt.txt" \
+              2>"/tmp/veda_g16_native/diagnostics-$attempt.txt" || {
+                echo "NATIVE_INFERENCE_FAILED_ATTEMPT=$attempt"
+                sed -n '1,35p' "/tmp/veda_g16_native/diagnostics-$attempt.txt"
+                exit 1
+              }
+            test -s "/tmp/veda_g16_native/output-$attempt.txt"
+            grep -Eiq '(^|[^[:alpha:]])Paris([^[:alpha:]]|$)' "/tmp/veda_g16_native/output-$attempt.txt"
+            printf "G1.6 MANAGED_NATIVE_ATTEMPT_%s_SHA256=" "$attempt"
+            sha256sum "/tmp/veda_g16_native/output-$attempt.txt" | awk '{print $1}'
+          done
+          cmp -s /tmp/veda_g16_native/output-1.txt /tmp/veda_g16_native/output-2.txt
+          final_oom="$(awk '$1=="oom_kill"{print $2}' "$C/memory.events")"
+          final_pids="$(awk '$1=="max"{print $2}' "$C/pids.events")"
+          test "$final_oom" = "$initial_oom"
+          test "$final_pids" = "$initial_pids"
+          actual="$(sha256sum /tmp/veda_g16_native/output-1.txt | awk '{print $1}')"
+          if test "$actual" = "$G14_BASELINE_SHA256"; then
+            echo "G1.6 G14_BYTE_BASELINE=MATCH"
+          else
+            echo "G1.6 G14_BYTE_BASELINE=DIFFERENT_IMAGE_BINARY_NOT_EQUIVALENT"
+          fi
+          echo "G1.6 MANAGED_NATIVE_SEMANTIC=PASS"
+          echo "G1.6 MANAGED_NATIVE_OUTPUT_REPRODUCIBILITY=PASS_2_OF_2"
+          echo "G1.6 MANAGED_NATIVE_KERNEL_E2E=PASS"
+          echo "G1.6 NATIVE_OOM_KILL_DELTA=0"
+          echo "G1.6 NATIVE_PIDS_MAX_DELTA=0"
+          echo "G1.6 ROOTLESS_DELEGATION_E2E=NOT_RUN"
+          echo "G1.6 TRUST_G0=HOLD"
+          {
+            echo '## VEDA G1.6 Managed Kernel + Native GGUF'
+            echo '| Gate | Result |'
+            echo '|---|---|'
+            echo '| Kernel cgroup memory.max | 768 MiB |'
+            echo '| Kernel cgroup pids.max | 48 |'
+            echo '| Nonroot, cap-drop, no-new-privileges, socket inaccessible | PASS |'
+            echo '| Pinned GGUF SHA256 | PASS |'
+            echo '| Native inference + Paris semantic | PASS x2 |'
+            echo '| Inference byte reproducibility | PASS x2 |'
+            echo "| G1.4 output baseline | $([ "$actual" = "$G14_BASELINE_SHA256" ] && echo MATCH || echo 'DIFFERENT_BINARY_VARIANT') |"
+            echo '| Memory OOM / process denial during positive inference | 0 / 0 |'
+            echo '| Rootless delegated subtree | NOT TESTED |'
+            echo '| Trust G0 | HOLD |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Always report constrained scope
+        if: always()
+        shell: bash
+        run: |
+          echo "Managed GitHub-owned container only; no direct cgroup writes or sudo."
+          echo "No Canonical Source, Governance Gate, Production, Deploy, or paid service."
+          echo "This does not certify rootless delegation or Trust G0."
