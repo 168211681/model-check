@@ -2,6 +2,11 @@ name: "VEDA G1.7 integrated generic GGUF Supervisor Seccomp kernel QA"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-integrated-portable-e2e.yml
 
 permissions:
   contents: read
@@ -226,10 +231,7 @@ jobs:
                 /usr/bin/python3 -S /tools/veda_g17_portable_seccomp_exec.py \
                 -- /portable/llama-completion \
                 --model /model/model.gguf \
-                --prompt 
-          echo "G1.7 ROOTLESS_DELEGATION=NOT_TESTED"
-          echo "G1.7 TRUST_G0=HOLD"
-Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+                --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
                 --n-predict 24 --ctx-size 256 --threads "$threads" --threads-batch "$threads" \
                 --temp 0 --seed 42 --no-display-prompt --no-conversation \
                 > "g17-unified-$threads-$trial.jsonl" 2> "g17-unified-$threads-$trial.err"
