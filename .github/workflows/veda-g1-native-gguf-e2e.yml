@@ -1,0 +1,99 @@
+name: "VEDA G1 Native GGUF E2E (model-check only)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g1-native-gguf-e2e
+  cancel-in-progress: false
+
+jobs:
+  native-gguf-e2e:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      LLAMA_COMMIT: 224d94c02b502470071921da10e8bcee1160d539
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+    steps:
+      - name: Scope, public-runner and no-write preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$RUNNER_OS" = "Linux"
+          test "$RUNNER_ARCH" = "X64"
+          echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
+          echo "No deployments, no repository writes, no credentials."
+
+      - name: Install Ubuntu-signed bubblewrap and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap ninja-build cmake g++ git ca-certificates curl
+          command -v bwrap
+
+      - name: Checkout pinned upstream llama.cpp without checkout action
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q llama-src
+          git -C llama-src remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama-src fetch --depth 1 origin "$LLAMA_COMMIT"
+          git -C llama-src checkout -q --detach FETCH_HEAD
+          test "$(git -C llama-src rev-parse HEAD)" = "$LLAMA_COMMIT"
+          echo "Pinned upstream commit: $LLAMA_COMMIT"
+
+      - name: Build native CPU-only llama-completion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S llama-src -B llama-src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build llama-src/build --target llama-completion --parallel 4
+          test -x llama-src/build/bin/llama-completion
+          sha256sum llama-src/build/bin/llama-completion
+          sha256sum "$(command -v bwrap)"
+
+      - name: Download Apache-2.0 GGUF and enforce upstream SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 20 --max-time 240 --output native-model.gguf "$MODEL_URL"
+          printf "%s  %s\n" "$MODEL_SHA256" native-model.gguf | sha256sum --check --status
+          test "$(stat -c %s native-model.gguf)" -gt 10000000
+          echo "GGUF SHA-256 verified: $MODEL_SHA256"
+
+      - name: Native GGUF inference inside network-isolated bubblewrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/veda-native-output.txt"
+          diagnostics="$RUNNER_TEMP/veda-native-diagnostics.txt"
+          timeout 120s bwrap --unshare-all --die-with-parent \
+            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --setenv HOME /tmp --chdir "$PWD" \
+            "$PWD/llama-src/build/bin/llama-completion" \
+            --model "$PWD/native-model.gguf" \
+            --prompt "The capital of France is" \
+            --n-predict 24 --ctx-size 256 --threads 2 \
+            --temp 0 --no-display-prompt --no-conversation \
+            >"$output" 2>"$diagnostics"
+          test -s "$output"
+          echo "Native GGUF E2E PASS: sandboxed CPU inference emitted output."
+          echo "Output bytes: $(wc -c < "$output")"
+          echo "No content uploaded; local temporary files expire with runner."
+
+      - name: Report reproducibility pins (even on failure)
+        if: always()
+        shell: bash
+        run: |
+          echo "Repo: $GITHUB_REPOSITORY"
+          echo "llama.cpp commit: $LLAMA_COMMIT"
+          echo "GGUF expected SHA-256: $MODEL_SHA256"
+          echo "Review-only test; NOT VEDA Canonical Source or Governance Gate."
