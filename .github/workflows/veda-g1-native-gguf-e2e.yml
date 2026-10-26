@@ -46,8 +46,9 @@ jobs:
           set +e
           timeout 15s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-            --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp \
-            -- /usr/bin/true >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
+            --ro-bind "$PWD" /work \
+            --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp --chdir /work \
+            -- /usr/bin/test -r /work >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
           status=$?
           set -e
           if test "$status" -ne 0; then
@@ -96,10 +97,11 @@ jobs:
           set +e
           timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --ro-bind "$PWD" /work \
             --uid 65534 --gid 65534 --clearenv \
-            --setenv HOME /tmp --chdir "$PWD" \
-            "$PWD/llama-src/build/bin/llama-completion" \
-            --model "$PWD/native-model.gguf" \
+            --setenv HOME /tmp --chdir /work \
+            /work/llama-src/build/bin/llama-completion \
+            --model /work/native-model.gguf \
             --prompt "The capital of France is" \
             --n-predict 24 --ctx-size 256 --threads 2 \
             --temp 0 --no-display-prompt --no-conversation \
