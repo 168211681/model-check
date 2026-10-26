@@ -40,40 +40,57 @@ def _rss(pid: int) -> int:
     return 0
 
 
-def _members(group: int) -> list[int]:
-    found = []
+def _enable_subreaper() -> None:
+    """Fail closed unless Linux supports adopting detached descendants."""
+    import ctypes
+    import errno
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno() or errno.EPERM, "subreaper unavailable")
+
+
+def _live_lineage(supervisor_pid: int, group: int) -> list[int]:
+    """Discover group members AND children adopted by the supervisor."""
+    table = {}
     for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        record = _stat(pid)
-        if record is not None and record[0] != "Z" and record[2] == group:
-            found.append(pid)
-    return found
-
-
-def _terminate_group(group: int, grace: float = 0.12) -> int:
-    # Group belongs to the child spawned with start_new_session=True.
-    try:
-        os.killpg(group, signal.SIGTERM)
-    except ProcessLookupError:
-        return 0
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        if not _members(group):
+        if name.isdigit():
+            pid = int(name)
+            row = _stat(pid)
+            if row is not None:
+                table[pid] = row
+    reachable = {supervisor_pid}
+    while True:
+        added = {pid for pid, (state, ppid, grp) in table.items()
+                 if pid not in reachable and ppid in reachable}
+        if not added:
             break
-        time.sleep(0.015)
-    if _members(group):
+        reachable.update(added)
+    return sorted(pid for pid, (state, ppid, grp) in table.items()
+                  if pid != supervisor_pid and state != "Z" and
+                  (pid in reachable or grp == group))
+
+
+def _terminate_lineage(supervisor_pid: int, group: int) -> int:
+    """Stop detached descendants too; the original group can disappear."""
+    for sig, grace in ((signal.SIGTERM, 0.16), (signal.SIGKILL, 0.4)):
+        pids = _live_lineage(supervisor_pid, group)
+        if not pids:
+            return 0
         try:
-            os.killpg(group, signal.SIGKILL)
+            os.killpg(group, sig)
         except ProcessLookupError:
             pass
-    for _ in range(40):
-        left = _members(group)
-        if not left:
-            return 0
-        time.sleep(0.015)
-    return len(_members(group))
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        end = time.monotonic() + grace
+        while time.monotonic() < end:
+            if not _live_lineage(supervisor_pid, group):
+                return 0
+            time.sleep(0.015)
+    return len(_live_lineage(supervisor_pid, group))
 
 
 def supervise(command: list[str], max_rss_mb: int = 64,
@@ -84,6 +101,8 @@ def supervise(command: list[str], max_rss_mb: int = 64,
     if not (0.15 <= timeout_s <= 60) or not (0.01 <= poll_s <= 0.1):
         raise ValueError("invalid timing bounds")
 
+    _enable_subreaper()  # required before spawning any managed child
+    supervisor_pid = os.getpid()
     t0 = time.monotonic()
     decision = "monitor_error"  # always fail closed on unexpected monitor failure
     observed_pids = 0
@@ -102,7 +121,7 @@ def supervise(command: list[str], max_rss_mb: int = 64,
             proc = subprocess.Popen(command, stdout=stdout, stderr=stderr,
                                     start_new_session=True, close_fds=True, preexec_fn=limited_child)
             while True:
-                members = _members(proc.pid)
+                members = _live_lineage(supervisor_pid, proc.pid)
                 count = len(members)
                 rss_bytes = sum(_rss(pid) for pid in members)
                 observed_pids = max(observed_pids, count)
@@ -122,17 +141,28 @@ def supervise(command: list[str], max_rss_mb: int = 64,
                     break
                 child_exit = proc.poll()
                 if child_exit is not None:
-                    decision = "exit_0" if child_exit == 0 else "exit_nonzero"
+                    orphaned = [pid for pid in _live_lineage(supervisor_pid, proc.pid)
+                                if pid != proc.pid]
+                    decision = ("orphan_descendants" if orphaned else
+                                ("exit_0" if child_exit == 0 else "exit_nonzero"))
                     break
                 time.sleep(poll_s)
         finally:
             if proc is not None:
-                left = _terminate_group(proc.pid)
+                left = _terminate_lineage(supervisor_pid, proc.pid)
                 try:
                     proc.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     left += 1
                 child_exit = proc.returncode
+                # Reap adopted grandchildren only after Popen has reaped its child.
+                while True:
+                    try:
+                        adopted, _status = os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    if adopted == 0:
+                        break
             else:
                 left = 0
         stdout.seek(0)
