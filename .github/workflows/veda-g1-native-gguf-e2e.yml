@@ -2,6 +2,11 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          if test "$GITHUB_EVENT_NAME" = push; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -48,7 +56,13 @@ jobs:
           printf 'VEDA_STAGE=%s\n' "$stage_dir" >> "$GITHUB_ENV"
           set +e
           timeout 15s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --tmpfs / \
+            --ro-bind /usr /usr \
+            --symlink usr/bin /bin \
+            --symlink usr/lib /lib \
+            --symlink usr/lib64 /lib64 \
+            --dev /dev --proc /proc --tmpfs /tmp \
+            --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
             --ro-bind "$stage_dir" /tmp/work \
             --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
             -- /usr/bin/test -r /tmp/work >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
@@ -74,6 +88,18 @@ jobs:
           assert os.geteuid() == 65534 and os.getegid() == 65534, "sandbox must run as nobody"
           assert os.readlink("/proc/self/ns/net") != os.environ["HOST_NETNS"], "network namespace not isolated"
           assert "GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ, "sensitive environment not cleared"
+          forbidden = ("/home", "/root", "/var", "/run", "/mnt", "/opt",
+                       "/workspace", "/etc/passwd", "/etc/shadow", "/etc/hosts")
+          exposed = [p for p in forbidden if os.path.lexists(p)]
+          assert not exposed, f"unexpected host paths visible: {exposed}"
+          with open("/proc/self/mountinfo", encoding="utf-8") as f:
+              mountinfo = [line.split() for line in f]
+          roots = [m for m in mountinfo if m[4] == "/"]
+          runtimes = [m for m in mountinfo if m[4] == "/usr"]
+          assert len(roots) == 1 and roots[0][roots[0].index("-") + 1] == "tmpfs", "sandbox root is not disposable tmpfs"
+          assert len(runtimes) == 1 and "ro" in runtimes[0][5].split(","), "runtime /usr is not read-only"
+          assert os.path.isdir("/usr/lib"), "required runtime libraries missing"
+
           with open("/proc/self/mountinfo", encoding="utf-8") as f:
               mounts = [line.split() for line in f if line.split()[4] == "/tmp/work"]
           assert len(mounts) == 1 and "ro" in mounts[0][5].split(","), "staged model mount not read-only"
@@ -95,11 +121,17 @@ jobs:
                   ), f"unexpected egress result: {exc!r}"
               else:
                   raise AssertionError("sandbox unexpectedly connected to the internet")
-          print("SECURITY PASS: UID/GID=65534, isolated netns, no external egress, staged mount ro, environment cleared")
+          print("SECURITY PASS: root tmpfs, /usr ro, /tmp/work ro, sensitive host paths absent, UID=65534, netns isolated, egress blocked, env cleared")
           PY
           chmod 0644 "$VEDA_STAGE/security_probe.py"
           timeout 20s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --tmpfs / \
+            --ro-bind /usr /usr \
+            --symlink usr/bin /bin \
+            --symlink usr/lib /lib \
+            --symlink usr/lib64 /lib64 \
+            --dev /dev --proc /proc --tmpfs /tmp \
+            --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
             --ro-bind "$VEDA_STAGE" /tmp/work \
             --uid 65534 --gid 65534 --clearenv \
             --setenv HOME /tmp --setenv HOST_NETNS "$host_netns" --chdir /tmp/work \
@@ -150,7 +182,13 @@ jobs:
             diagnostics="$RUNNER_TEMP/veda-native-diagnostics-$attempt.txt"
             set +e
             timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-              --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+              --tmpfs / \
+              --ro-bind /usr /usr \
+              --symlink usr/bin /bin \
+              --symlink usr/lib /lib \
+              --symlink usr/lib64 /lib64 \
+              --dev /dev --proc /proc --tmpfs /tmp \
+              --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
               --ro-bind "$VEDA_STAGE" /tmp/work \
               --uid 65534 --gid 65534 --clearenv \
               --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
