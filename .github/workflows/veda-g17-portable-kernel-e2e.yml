@@ -1,0 +1,108 @@
+name: "VEDA G1.7 portable CPU build and kernel-capped cross-worker output"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-portable-kernel-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g17-portable-cpu
+  cancel-in-progress: false
+
+jobs:
+  portable-cross-worker:
+    if: github.repository == '168211681/model-check'
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [a, b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      LLAMA_COMMIT: 224d94c02b502470071921da10e8bcee1160d539
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+    steps:
+      - name: Exact source and CPU-generic non-native compile without installing packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          for cmd in git cmake ninja gcc g++ tar curl docker sha256sum; do command -v "$cmd" >/dev/null; done
+          git init -q llama-src
+          git -C llama-src remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama-src fetch --depth 1 origin "$LLAMA_COMMIT"
+          git -C llama-src checkout -q --detach FETCH_HEAD
+          test "$(git -C llama-src rev-parse HEAD)" = "$LLAMA_COMMIT"
+          cmake -S llama-src -B llama-src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_CPU_REPACK=OFF \
+            -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_AVX512=OFF \
+            -DGGML_AVX_VNNI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF \
+            -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_SSE42=OFF -DGGML_BMI2=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          for opt in GGML_NATIVE GGML_CPU_ALL_VARIANTS GGML_CPU_REPACK GGML_AVX GGML_AVX2 GGML_AVX512 GGML_FMA GGML_F16C GGML_SSE42 GGML_BMI2; do
+            grep -q "^$opt:BOOL=OFF$" llama-src/build/CMakeCache.txt
+          done
+          cmake --build llama-src/build --target llama-completion --parallel 3
+          test -x llama-src/build/bin/llama-completion
+          mkdir -p portable model
+          cp -a llama-src/build/bin/. portable/
+          sha256sum portable/llama-completion
+          echo "G1.7 PORTABLE_GENERIC_BUILD=PASS"
+          echo "G1.7 GGML_NATIVE_AVX_FMA_SIMD=DISABLED"
+          echo "G1.7 LLAMA_COMMIT=$LLAMA_COMMIT"
+
+      - name: SHA-256 pinned model and bounded hardware metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 --output model/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" model/model.gguf | sha256sum --check --status
+          chmod -R a+rX portable model
+          echo "G1.7 PORTABLE_MODEL_PIN=PASS"
+          awk -F':' '/^vendor_id/{print "G1.7 CPU_VENDOR="$2;exit}' /proc/cpuinfo
+          awk -F':' '/^model name/{print "G1.7 CPU_MODEL="$2;exit}' /proc/cpuinfo
+          echo "G1.7 COMPILER_VERSION=$(g++ -dumpfullversion)"
+          echo "G1.7 PORTABLE_BINARY_SHA256=$(sha256sum portable/llama-completion | awk '{print $1}')"
+
+      - name: Offline GGUF in disposable nonroot kernel-capped Docker, 1 and 2 threads
+        shell: bash
+        run: |
+          set -euo pipefail
+          home="$PWD"
+          for threads in 1 2; do
+            for attempt in 1 2; do
+              timeout 65s docker run --rm \
+                --network none \
+                --memory 768m --memory-swap 768m --pids-limit 48 \
+                --cap-drop ALL --security-opt no-new-privileges \
+                --user 65534:65534 --read-only \
+                --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+                --mount "type=bind,source=$home/portable,target=/portable,readonly" \
+                --mount "type=bind,source=$home/model,target=/model,readonly" \
+                --env LD_LIBRARY_PATH=/portable \
+                --entrypoint /portable/llama-completion \
+                ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c \
+                --model /model/model.gguf \
+                --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+                --n-predict 24 --ctx-size 256 --threads "$threads" --threads-batch "$threads" \
+                --temp 0 --seed 42 --no-display-prompt --no-conversation \
+                > "portable-$threads-$attempt.out" 2> "portable-$threads-$attempt.stderr"
+              test -s "portable-$threads-$attempt.out"
+              grep -q Paris "portable-$threads-$attempt.out"
+              printf 'G1.7 PORTABLE_THREADS_%s_ATTEMPT_%s_SHA256=' "$threads" "$attempt"
+              sha256sum "portable-$threads-$attempt.out" | awk '{print $1}'
+            done
+            cmp "portable-$threads-1.out" "portable-$threads-2.out"
+            echo "G1.7 PORTABLE_THREADS_$threads WITHIN_WORKER=PASS_2_OF_2"
+          done
+          echo "G1.7 PORTABLE_GGUF_KERNEL_CAPPED_POSITIVE=PASS"
+          echo "G1.7 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.7 TRUST_G0=HOLD"
