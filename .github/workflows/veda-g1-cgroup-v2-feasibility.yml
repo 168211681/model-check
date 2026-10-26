@@ -2,11 +2,6 @@ name: "VEDA G1.5 cgroup v2 read-only feasibility (model-check only)"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g1-cgroup-v2-feasibility.yml
 
 permissions:
   contents: read
