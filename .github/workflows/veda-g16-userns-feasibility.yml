@@ -2,11 +2,6 @@ name: "VEDA G1.6 user namespace feasibility - nonroot read-only"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g16-userns-feasibility.yml
 
 permissions:
   contents: read
