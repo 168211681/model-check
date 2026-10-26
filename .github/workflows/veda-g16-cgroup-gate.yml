@@ -2,6 +2,11 @@ name: "VEDA G1.6 cgroup v2 delegated hard-limit readiness (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-cgroup-gate.yml
 
 permissions:
   contents: read
