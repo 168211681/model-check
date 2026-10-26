@@ -43,10 +43,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          stage_dir="$(mktemp -d -p /tmp veda-g1-stage.XXXXXX)"
+          chmod 0755 "$stage_dir"
+          printf 'VEDA_STAGE=%s\n' "$stage_dir" >> "$GITHUB_ENV"
           set +e
           timeout 15s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-            --ro-bind "$PWD" /work \
+            --ro-bind "$stage_dir" /work \
             --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp --chdir /work \
             -- /usr/bin/test -r /work >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
           status=$?
@@ -94,10 +97,15 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/veda-native-output.txt"
           diagnostics="$RUNNER_TEMP/veda-native-diagnostics.txt"
+          cp -a llama-src/build/bin "$VEDA_STAGE/bin"
+          cp native-model.gguf "$VEDA_STAGE/native-model.gguf"
+          chmod -R a+rX "$VEDA_STAGE"
+          test -x "$VEDA_STAGE/bin/llama-completion"
+          test -r "$VEDA_STAGE/native-model.gguf"
           set +e
           timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-            --ro-bind "$PWD" /work \
+            --ro-bind "$VEDA_STAGE" /work \
             --uid 65534 --gid 65534 --clearenv \
             --setenv HOME /tmp --chdir /work \
             /work/llama-src/build/bin/llama-completion \
