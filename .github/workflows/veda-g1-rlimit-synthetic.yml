@@ -2,6 +2,11 @@ name: "VEDA G1.5 Synthetic RLIMIT QA (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-rlimit-synthetic.yml
 
 permissions:
   contents: read
@@ -105,17 +110,22 @@ jobs:
                           os.close(fd)
               elif mode == "nproc":
                   require(os.geteuid() == 65534, "NPROC needs nonroot test uid")
-                  resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
+                  # NPROC applies per real UID and may be unenforced under runner/user-namespace conditions.
+                  resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+                  real_uid = os.getuid()
+                  effective_uid = os.geteuid()
+                  with open("/proc/self/status", encoding="utf-8") as source:
+                      cap_eff = next((line.split()[1] for line in source if line.startswith("CapEff:")), "unknown")
                   try:
                       pid = os.fork()
                   except OSError as exc:
                       require(exc.errno == errno.EAGAIN, f"unexpected fork errno: {exc}")
-                      print("RLIMIT_NPROC PASS: fork() rejected by per-real-UID limit")
+                      print(f"RLIMIT_NPROC PASS: fork denied EAGAIN; real_uid={real_uid}; effective_uid={effective_uid}; CapEff={cap_eff}")
                   else:
                       if pid == 0:
                           os._exit(0)
                       os.waitpid(pid, 0)
-                      raise AssertionError("fork unexpectedly succeeded under NPROC=1")
+                      print(f"RLIMIT_NPROC NOT_ENFORCED: fork succeeded with NPROC=0; real_uid={real_uid}; effective_uid={effective_uid}; CapEff={cap_eff}")
               elif mode == "cpu":
                   resource.setrlimit(resource.RLIMIT_CPU, (1, 2))
                   def cpu_limit_handler(signum, frame):
@@ -156,6 +166,7 @@ jobs:
           require("GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ, "secret environment exposed")
           tests = ("as", "fsize", "nofile", "nproc", "cpu", "core", "positive", "positive")
           positive_hashes = []
+          nproc_result = "UNTESTED"
           for test in tests:
               completed = subprocess.run(
                   [sys.executable, "/tmp/work/rlimit_synthetic.py", test],
@@ -167,8 +178,13 @@ jobs:
                   print(completed.stderr[-800:])
                   sys.exit(1)
               lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-              require(any(x.startswith("RLIMIT_") and " PASS:" in x for x in lines),
-                      f"test {test} did not emit PASS evidence")
+              if test == "nproc":
+                  require(any(x.startswith("RLIMIT_NPROC PASS:") or x.startswith("RLIMIT_NPROC NOT_ENFORCED:") for x in lines),
+                          "NPROC classification missing")
+                  nproc_result = "PASS" if any(x.startswith("RLIMIT_NPROC PASS:") for x in lines) else "NOT_ENFORCED"
+              else:
+                  require(any(x.startswith("RLIMIT_") and " PASS:" in x for x in lines),
+                          f"test {test} did not emit PASS evidence")
               print(completed.stdout.strip(), flush=True)
               if test == "positive":
                   positives = [x.split("SHA256=")[1] for x in lines if "SHA256=" in x]
@@ -176,7 +192,9 @@ jobs:
                   positive_hashes.extend(positives)
           require(len(positive_hashes) == 2 and positive_hashes[0] == positive_hashes[1],
                   "positive result not reproducible within isolated sandbox")
-          print("G1.5 SYNTHETIC RLIMIT QA PASS: 6 negative/ceiling probes, two deterministic controls")
+          require(nproc_result != "UNTESTED", "NPROC observation missing")
+          print(f"G1.5 SYNTHETIC RLIMIT QA COMPLETE: five enforced limits, NPROC={nproc_result}, two deterministic controls")
+          print("G1.5 RESOURCE ISOLATION GATE: HOLD (cgroup v2 delegation absent; NPROC must be reported separately)")
           print("LIMITATION: these are per-process/per-real-UID limits, NOT cgroup process-tree memory enforcement")
           PY
           chmod 0644 "$stage/rlimit_synthetic.py"
@@ -201,11 +219,12 @@ jobs:
             /usr/bin/python3 /tmp/work/rlimit_synthetic.py harness
           echo "G1.5 SYNTHETIC SANDBOX COMPLETE"
           {
-            echo '## VEDA G1.5 Synthetic RLIMIT QA'
+            echo '## VEDA G1.5 Synthetic RLIMIT QA (resource isolation HOLD)'
             echo '| Check | Result |'
             echo '|---|---|'
             echo '| Virtual address space, output file size, open descriptors | Tested |'
-            echo '| Process-per-UID ceiling, CPU time, core dump | Tested |'
+            echo '| Process-per-UID ceiling | Classified in logs, not assumed enforced |'
+            echo '| CPU time and core dump | Tested |'
             echo '| Positive deterministic control, 2/2 | Tested |'
             echo '| cgroup v2 delegation / process tree memory | BLOCKED, not tested |'
             echo '| Trust G0 | HOLD, unchanged |'
