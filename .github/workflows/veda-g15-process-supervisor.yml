@@ -2,6 +2,11 @@ name: "VEDA G1.5 App Supervisor synthetic sandbox (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g15-process-supervisor.yml
 
 permissions:
   contents: read
@@ -14,7 +19,11 @@ jobs:
   synthetic-supervisor:
     if: github.repository == '168211681/model-check'
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 25
+    env:
+      LLAMA_COMMIT: 224d94c02b502470071921da10e8bcee1160d539
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
     steps:
       - name: Scope and no-write preflight
         shell: bash
@@ -33,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap libseccomp2 git ca-certificates
+          sudo apt-get install -y --no-install-recommends bubblewrap libseccomp2 git ca-certificates ninja-build cmake g++ curl
           command -v bwrap
 
       - name: Fetch pinned revision of public model-check source
@@ -176,6 +185,95 @@ jobs:
             echo '| Seccomp and Bubblewrap security | PASS if step succeeds |'
             echo '| cgroup v2 process-tree enforcement | HOLD / not tested |'
             echo '| Trust G0 | HOLD unchanged |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout pinned upstream llama.cpp without checkout action
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q llama-src
+          git -C llama-src remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama-src fetch --depth 1 origin "$LLAMA_COMMIT"
+          git -C llama-src checkout -q --detach FETCH_HEAD
+          test "$(git -C llama-src rev-parse HEAD)" = "$LLAMA_COMMIT"
+          echo "Pinned upstream commit: $LLAMA_COMMIT"
+
+      - name: Build native CPU-only llama-completion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S llama-src -B llama-src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build llama-src/build --target llama-completion --parallel 4
+          test -x llama-src/build/bin/llama-completion
+          sha256sum llama-src/build/bin/llama-completion
+          sha256sum "$(command -v bwrap)"
+
+      - name: Download Apache-2.0 GGUF and enforce upstream SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 20 --max-time 240 --output native-model.gguf "$MODEL_URL"
+          printf "%s  %s\n" "$MODEL_SHA256" native-model.gguf | sha256sum --check --status
+          test "$(stat -c %s native-model.gguf)" -gt 10000000
+          echo "GGUF SHA-256 verified: $MODEL_SHA256"
+
+      - name: Stage pinned native GGUF inside sandbox directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a llama-src/build/bin "$VEDA_G15_STAGE/bin"
+          cp native-model.gguf "$VEDA_G15_STAGE/native-model.gguf"
+          chmod -R a+rX "$VEDA_G15_STAGE"
+          test -x "$VEDA_G15_STAGE/bin/llama-completion"
+          test -r "$VEDA_G15_STAGE/native-model.gguf"
+          echo "G1.5 native binary and verified model staged read-only."
+
+      - name: Verify native GGUF under Supervisor and Seccomp twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            output="$RUNNER_TEMP/g15-supervised-native-$attempt.jsonl"
+            timeout 105s sudo --non-interactive /usr/bin/python3 \
+              "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+              "$VEDA_G15_STAGE" "$(readlink /proc/self/ns/net)" \
+              /usr/bin/python3 -S /tmp/work/veda_g15_process_supervisor.py \
+              --max-rss-mb 768 --max-processes 2 --timeout-s 45 -- \
+              /tmp/work/bin/llama-completion \
+              --model /tmp/work/native-model.gguf \
+              --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+              --n-predict 24 --ctx-size 256 --threads 2 \
+              --temp 0 --seed 42 --no-display-prompt --no-conversation \
+              > "$output"
+            python3 - "$output" "$attempt" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          contents = Path(sys.argv[1]).read_text()
+          results = [json.loads(line.partition("VEDA_SUPERVISOR_RESULT=")[2]) for line in contents.splitlines()
+                     if line.startswith("VEDA_SUPERVISOR_RESULT=")]
+          assert len(results) == 1, "missing or ambiguous supervisor record"
+          r = results[0]
+          assert r["decision"] == "exit_0", f"inference did not complete: {r}"
+          assert r["alive_group_after"] == 0, f"process-group cleanup failed: {r}"
+          assert "Paris" in r["stdout_excerpt"], "semantic result did not contain Paris"
+          baseline = "d7a3611195b24f1246701c68beaa1a3a641b4b759607a45bb837b36294461c53"
+          assert r["stdout_sha256"] == baseline, f"output differs from G1.4 baseline: {r['stdout_sha256']}"
+          print(f"G1.5 SUPERVISED NATIVE PASS attempt {sys.argv[2]}: SHA256={baseline}, cleanup=0")
+          PY
+          done
+          echo "G1.5 SUPERVISED NATIVE CROSS-RUN PASS: SHA256 matches G1.4 twice."
+          echo "G1.5 KERNEL CGROUP v2: HOLD (no delegation); app supervisor is best-effort only."
+          {
+            echo '## VEDA G1.5 Supervised Native GGUF'
+            echo '| Check | Result |'
+            echo '|---|---|'
+            echo '| Pinned llama.cpp and verified GGUF | PASS |'
+            echo '| Supervisor + Seccomp inference x2 | PASS |'
+            echo '| Deterministic output matches G1.4 | PASS |'
+            echo '| Group cleanup | PASS |'
+            echo '| Kernel cgroup v2 memory/pids enforcement | HOLD |'
+            echo '| Trust G0 | HOLD |'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report scope and limitations
