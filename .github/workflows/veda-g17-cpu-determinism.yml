@@ -1,0 +1,242 @@
+name: "VEDA G1.7 CPU determinism cross-run diagnostics"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-cpu-determinism.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g17-cpu-determinism
+  cancel-in-progress: false
+
+jobs:
+  unified-sandbox-native:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    container:
+      image: ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c
+      options: >-
+        --memory=768m
+        --memory-swap=768m
+        --pids-limit=48
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --read-only
+        --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
+        --user=65534:65534
+    env:
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+      OFFICIAL_IMAGE_OUTPUT_SHA256: 30f90e7d02725db7a7ab0d740ad3bbcd276876dc9ad5994b50d626469dbbcbb7
+      G14_BASELINE_SHA256: d7a3611195b24f1246701c68beaa1a3a641b4b759607a45bb837b36294461c53
+      G15_SUPERVISOR_SHA256: b48f1fe8c5567bb4b4e23feb618c54f5aa5a3d0d85211d0324c2b5fbe9fac65e
+      LD_LIBRARY_PATH: /app
+    steps:
+      - name: Fail-closed scope, identity, cgroup and Docker socket preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = refs/heads/main
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          test "$(id -u)" = 65534
+          test "$(id -g)" = 65534
+          test "$(cat /sys/fs/cgroup/memory.max)" = 805306368
+          test "$(cat /sys/fs/cgroup/pids.max)" = 48
+          test "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = 0000000000000000
+          test "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = 1
+          test ! -r /var/run/docker.sock
+          test ! -w /var/run/docker.sock
+          test -x /app/llama-completion
+          test -x /usr/bin/python3
+          test -r /usr/lib/x86_64-linux-gnu/libseccomp.so.2
+          /usr/bin/python3 -S - <<'PY'
+          import errno, os, stat
+          from pathlib import Path
+          mounts={}
+          for line in Path("/proc/self/mountinfo").read_text().splitlines():
+              fields=line.split()
+              if len(fields)>5:
+                  mounts[fields[4]]=fields[5].split(",")
+          assert "/" in mounts and "ro" in mounts["/"], f"BLOCKED: root mount not read-only: {mounts.get('/')}"
+          assert "/tmp" in mounts, "BLOCKED: /tmp not separate tmpfs"
+          for attr in ("rw", "nodev", "nosuid", "noexec"):
+              assert attr in mounts["/tmp"], f"BLOCKED: /tmp missing mount option {attr}: {mounts['/tmp']}"
+          marker=Path("/tmp/veda_g16_noexec_canary.sh")
+          marker.write_text("#!/bin/sh\nexit 0\n")
+          marker.chmod(0o700)
+          pid=os.fork()
+          if pid==0:
+              try: os.execv(str(marker),[str(marker)])
+              except OSError as exc:
+                  os._exit(0 if exc.errno in (errno.EACCES,errno.EPERM) else 21)
+              os._exit(22)
+          _,st=os.waitpid(pid,0)
+          marker.unlink()
+          assert os.WIFEXITED(st) and os.WEXITSTATUS(st)==0, f"BLOCKED: /tmp allowed native exec: {st}"
+          print("G1.6 UNIFIED_READONLY_ROOT=PASS",flush=True)
+          print("G1.6 UNIFIED_TMPFS_NOEXEC=PASS",flush=True)
+          PY
+          echo "G1.6 UNIFIED_SCOPE=PASS"
+          echo "G1.6 UNIFIED_KERNEL_MEMORY_MAX=805306368"
+          echo "G1.6 UNIFIED_KERNEL_PIDS_MAX=48"
+          echo "G1.6 UNIFIED_NONROOT_CAPS=NONE"
+          echo "G1.6 UNIFIED_DOCKER_SOCKET_INACCESSIBLE=PASS"
+          echo "G1.6 UNIFIED_CGROUP_WRITES=NONE"
+          echo "G1.6 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.6 TRUST_G0=HOLD"
+
+      - name: Retrieve and verify exact G1.5 process supervisor and G1.6 seccomp launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/veda_g16_combined
+          for file in veda_g15_process_supervisor.py veda_g16_seccomp_exec.py; do
+            curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
+              --output "/tmp/veda_g16_combined/$file" \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/$file"
+            test -s "/tmp/veda_g16_combined/$file"
+          done
+          printf '%s  %s\n' "$G15_SUPERVISOR_SHA256" \
+            /tmp/veda_g16_combined/veda_g15_process_supervisor.py | sha256sum --check --status
+          /usr/bin/python3 -S -m py_compile \
+            /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+            /tmp/veda_g16_combined/veda_g16_seccomp_exec.py
+          sha256sum /tmp/veda_g16_combined/*.py
+          echo "G1.6 UNIFIED_SOURCE_INTEGRITY=PASS"
+
+      - name: Verify seccomp inherited across exec under the original G1.5 supervisor
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+            --max-rss-mb 200 --max-as-mb 3072 --max-processes 4 --timeout-s 12 -- \
+            /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g16_seccomp_exec.py \
+            --post-exec-selftest > /tmp/veda_g16_combined/negative-control.jsonl
+          /usr/bin/python3 -S - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("/tmp/veda_g16_combined/negative-control.jsonl").read_text().splitlines()
+          records=[json.loads(line.split("VEDA_SUPERVISOR_RESULT=",1)[1])
+                   for line in lines if line.startswith("VEDA_SUPERVISOR_RESULT=")]
+          assert len(records)==1, "BLOCKED: missing supervisor record"
+          r=records[0]
+          assert r["decision"]=="exit_0" and r["child_exit"]==0 and r["alive_group_after"]==0, r
+          assert "G1.6 SECCOMP_PERSISTED_ACROSS_EXEC=PASS" in r["stdout_excerpt"], r
+          assert "G1.6 SECCOMP_POLICY_LOADED=27_DENIED_SYSCALLS" in r["stderr_excerpt"], r
+          print("G1.6 UNIFIED_SECCOMP_27_DENIED=PASS")
+          print("G1.6 UNIFIED_SECCOMP_SURVIVES_EXEC=PASS")
+          print("G1.6 UNIFIED_G15_PROCESS_SUPERVISOR_NEGATIVE_QA=PASS")
+          PY
+
+      - name: Download SHA256-pinned GGUF outside the supervised offline inference process
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 \
+            --output /tmp/veda_g16_combined/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" /tmp/veda_g16_combined/model.gguf | sha256sum --check --status
+          test "$(stat -c %s /tmp/veda_g16_combined/model.gguf)" -gt 10000000
+          chmod 0400 /tmp/veda_g16_combined/model.gguf
+          echo "G1.6 UNIFIED_PINNED_GGUF=PASS"
+
+          - name: Log CPU family, feature subset, and pinned binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -S - <<'PY'
+          from pathlib import Path
+          header=Path("/proc/cpuinfo").read_text(errors="replace").split("\n\n")[0]
+          fields=dict((line.split(":",1)[0].strip(),line.split(":",1)[1].strip()) for line in header.splitlines() if ":" in line)
+          selected=("sse4_2","fma","avx","avx2","avx512f","avx512bw","avx512_vnni","avx_vnni","amx_int8","f16c","bmi2")
+          flags=set(fields.get("flags","").split())
+          print("G1.7 CPU_VENDOR="+fields.get("vendor_id","UNKNOWN"),flush=True)
+          print("G1.7 CPU_MODEL="+fields.get("model name","UNKNOWN")[:130],flush=True)
+          print("G1.7 CPU_FAMILY="+fields.get("cpu family","UNKNOWN"),flush=True)
+          print("G1.7 CPU_FEATURES="+",".join(f for f in selected if f in flags),flush=True)
+          for line in Path("/proc/self/status").read_text().splitlines():
+              if line.startswith("Cpus_allowed_list:"):
+                  print("G1.7 CPU_AFFINITY="+line.split(":",1)[1].strip(),flush=True)
+          PY
+          /app/llama-completion --version 2>&1 | head -n 12 || true
+          echo "G1.7 MODEL_SHA256=$MODEL_SHA256"
+          echo "G1.7 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.7 TRUST_G0=HOLD"
+
+      - name: Compare 2-thread and 1-thread inference under unified security gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          before_oom="$(awk '$1=="oom_kill"{print $2}' /sys/fs/cgroup/memory.events)"
+          before_pids="$(awk '$1=="max"{print $2}' /sys/fs/cgroup/pids.events)"
+          for mode in dual single; do
+            case "$mode" in dual) threads=2 ;; single) threads=1 ;; *) exit 1 ;; esac
+            for attempt in 1 2; do
+              set +e
+              /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+                --max-rss-mb 600 --max-as-mb 3072 --max-processes 8 --timeout-s 55 -- \
+                /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g16_seccomp_exec.py \
+                -- /app/llama-completion \
+                --model /tmp/veda_g16_combined/model.gguf \
+                --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+                --n-predict 24 --ctx-size 256 --threads "$threads" --threads-batch "$threads" \
+                --temp 0 --seed 42 --no-display-prompt --no-conversation \
+                > "/tmp/veda_g16_combined/diagnostic-$mode-$attempt.jsonl"
+              outcome=$?
+              set -e
+              if test "$outcome" -ne 0; then
+                echo "G1.7 FAIL_CLOSED_SUPERVISOR=$mode,$attempt,$outcome"
+                grep '^VEDA_SUPERVISOR_RESULT=' "/tmp/veda_g16_combined/diagnostic-$mode-$attempt.jsonl" || true
+                exit "$outcome"
+              fi
+              /usr/bin/python3 -S - "$mode" "$attempt" <<'PY'
+          import json,sys
+          from pathlib import Path
+          mode, attempt=sys.argv[1:3]
+          contents=Path(f"/tmp/veda_g16_combined/diagnostic-{mode}-{attempt}.jsonl").read_text().splitlines()
+          rows=[json.loads(line.partition("VEDA_SUPERVISOR_RESULT=")[2])
+                for line in contents if line.startswith("VEDA_SUPERVISOR_RESULT=")]
+          assert len(rows)==1, "Supervisor decision not unique"
+          r=rows[0]
+          assert r["decision"]=="exit_0" and r["child_exit"]==0 and r["alive_group_after"]==0, r
+          assert "Paris" in r["stdout_excerpt"], f"semantic output missing Paris: {r}"
+          assert "SECCOMP_POLICY_LOADED=27_DENIED_SYSCALLS" in r["stderr_excerpt"], r
+          assert r["max_observed_processes"]<=8 and r["max_observed_rss_bytes"]<600*1024*1024, r
+          Path(f"/tmp/veda_g16_combined/{mode}-{attempt}.sha").write_text(r["stdout_sha256"])
+          print(f"G1.7 {mode.upper()}_ATTEMPT_{attempt}_SHA256={r['stdout_sha256']}",flush=True)
+          print(f"G1.7 {mode.upper()}_ATTEMPT_{attempt}_EXCERPT={r['stdout_excerpt']!r}",flush=True)
+          print(f"G1.7 {mode.upper()}_ATTEMPT_{attempt}_RSS_BYTES={r['max_observed_rss_bytes']}",flush=True)
+          PY
+            done
+            if cmp -s "/tmp/veda_g16_combined/$mode-1.sha" "/tmp/veda_g16_combined/$mode-2.sha"; then
+              echo "G1.7 $mode WITHIN_WORKER=PASS_2_OF_2"
+            else
+              echo "G1.7 $mode WITHIN_WORKER=FAIL"
+              exit 1
+            fi
+          done
+          test "$before_oom" = "$(awk '$1=="oom_kill"{print $2}' /sys/fs/cgroup/memory.events)"
+          test "$before_pids" = "$(awk '$1=="max"{print $2}' /sys/fs/cgroup/pids.events)"
+          echo "G1.7 SECURE_CPU_DIAGNOSTIC=PASS"
+          echo "G1.7 CROSS_WORKER_BYTE_DETERMINISM=NOT_ESTABLISHED_BY_SINGLE_WORKER"
+          echo "G1.7 ROOTLESS_NAMESPACE=BLOCKED"
+          echo "G1.7 TRUST_G0=HOLD"
+
+  - name: Always report governance hold and container boundaries
+        if: always()
+        shell: bash
+        run: |
+          echo "G1.6 combined QA only: G1.5 Supervisor + 27 Seccomp-denied syscalls + GitHub-managed kernel cgroups."
+          echo "No bubblewrap inside container, no rootless delegated subtree, no direct cgroup writes."
+          echo "No sudo, no privileged container, no Production, no Canonical Source or Governance changes."
+          echo "Trust G0 HOLD."
