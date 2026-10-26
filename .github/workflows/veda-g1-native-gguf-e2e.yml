@@ -2,11 +2,6 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -30,10 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
-          if test "$GITHUB_EVENT_NAME" = push; then
-            test "$GITHUB_REF" = "refs/heads/main"
-          fi
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -164,7 +156,7 @@ jobs:
               --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
               /tmp/work/bin/llama-completion \
               --model /tmp/work/native-model.gguf \
-              --prompt $'Capital city quiz:\\nGermany: Berlin\\nItaly: Rome\\nSpain: Madrid\\nFrance:' \
+              --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
               --n-predict 24 --ctx-size 256 --threads 2 \
               --temp 0 --seed 42 --no-display-prompt --no-conversation \
               >"$output" 2>"$diagnostics"
