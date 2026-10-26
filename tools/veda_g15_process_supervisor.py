@@ -3,6 +3,8 @@
 
 Runs inside an already-isolated disposable Bubblewrap PID+network namespace as
 UID 65534, not a substitute for cgroup v2 memory.max or pids.max.
+Per-process RLIMIT_AS is a kernel-enforced virtual address-space ceiling and
+is not a cap on total process-tree resident memory.
 """
 from __future__ import annotations
 
@@ -95,11 +97,13 @@ def _terminate_lineage(supervisor_pid: int, group: int) -> int:
 
 def supervise(command: list[str], max_rss_mb: int = 64,
               max_processes: int = 4, timeout_s: float = 2,
-              poll_s: float = 0.025) -> dict[str, Any]:
+              poll_s: float = 0.025, max_as_mb: int = 3072) -> dict[str, Any]:
     if not command or not (16 <= max_rss_mb <= 1024) or not (1 <= max_processes <= 32):
         raise ValueError("invalid command or resource bounds")
     if not (0.15 <= timeout_s <= 60) or not (0.01 <= poll_s <= 0.1):
         raise ValueError("invalid timing bounds")
+    if not isinstance(max_as_mb, int) or not 128 <= max_as_mb <= 4096:
+        raise ValueError("max_as_mb must be 128..4096 MiB of per-process virtual address space")
 
     _enable_subreaper()  # required before spawning any managed child
     supervisor_pid = os.getpid()
@@ -111,7 +115,14 @@ def supervise(command: list[str], max_rss_mb: int = 64,
     proc = None
 
     def limited_child():
-        # Defense in depth: cap output growth and disable core files in target processes.
+        # Defense in depth: kernel enforces an instantaneous address-space
+        # ceiling even when a short RSS spike evades the sampling monitor.
+        # Applies per process; NOT aggregate RSS or cgroup memory.max.
+        limit_as = max_as_mb * 1024 * 1024
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY and limit_as > hard:
+            raise ValueError("requested RLIMIT_AS exceeds inherited hard limit")
+        resource.setrlimit(resource.RLIMIT_AS, (limit_as, limit_as))
         resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
@@ -186,6 +197,7 @@ def supervise(command: list[str], max_rss_mb: int = 64,
 def main() -> int:
     parser = argparse.ArgumentParser(description="Best-effort app supervisor; not a cgroup replacement")
     parser.add_argument("--max-rss-mb", type=int, default=64)
+    parser.add_argument("--max-as-mb", type=int, default=3072, help="kernel virtual address-space limit per process, not aggregate RSS")
     parser.add_argument("--max-processes", type=int, default=4)
     parser.add_argument("--timeout-s", type=float, default=2.0)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -193,7 +205,8 @@ def main() -> int:
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
-    result = supervise(command, args.max_rss_mb, args.max_processes, args.timeout_s)
+    result = supervise(command, args.max_rss_mb, args.max_processes, args.timeout_s,
+                       max_as_mb=args.max_as_mb)
     print("VEDA_SUPERVISOR_RESULT=" + json.dumps(result, sort_keys=True), flush=True)
     return 0 if result["decision"] == "exit_0" and result["alive_group_after"] == 0 else 1
 
