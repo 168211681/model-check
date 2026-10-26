@@ -2,6 +2,11 @@ name: "VEDA G1.6 cgroup v2 delegated hard-limit readiness (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-cgroup-gate.yml
 
 permissions:
   contents: read
@@ -39,8 +44,9 @@ jobs:
           git -C probe-source checkout -q --detach FETCH_HEAD
           test "$(git -C probe-source rev-parse HEAD)" = "$GITHUB_SHA"
           test -r probe-source/tools/veda_g16_cgroup_v2_gate.py
-          python3 -S -m py_compile probe-source/tools/veda_g16_cgroup_v2_gate.py
-          sha256sum probe-source/tools/veda_g16_cgroup_v2_gate.py
+          test -r probe-source/tools/veda_g16_gate_security_qa.py
+          python3 -S -m py_compile probe-source/tools/veda_g16_cgroup_v2_gate.py probe-source/tools/veda_g16_gate_security_qa.py
+          sha256sum probe-source/tools/veda_g16_cgroup_v2_gate.py probe-source/tools/veda_g16_gate_security_qa.py
 
       - name: Fail-closed synthetic delegation logic tests
         shell: bash
@@ -48,6 +54,13 @@ jobs:
           set -euo pipefail
           python3 -S probe-source/tools/veda_g16_cgroup_v2_gate.py --selftest
           echo "G1.6 GATE SELFTEST PASS"
+
+      - name: Reject false-positive delegation and fake kernel event evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -S probe-source/tools/veda_g16_gate_security_qa.py
+          echo "G1.6 SECURITY NEGATIVE QA PASS; kernel E2E remains NOT RUN"
 
       - name: Read-only real kernel cgroup delegation probe
         shell: bash
