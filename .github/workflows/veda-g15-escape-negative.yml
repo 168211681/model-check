@@ -1,7 +1,12 @@
-name: "VEDA G1.5 detached child escape negative test (model-check only)"
+name: "VEDA G1.5 detached child escape regression (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g15-escape-negative.yml
 
 permissions:
   contents: read
@@ -150,7 +155,7 @@ jobs:
           chmod 0644 "$stage/"*.py
           printf 'VEDA_STAGE=%s\n' "$stage" >> "$GITHUB_ENV"
 
-      - name: Test detached group escape inside Bubblewrap and Seccomp
+      - name: Verify hardened descendant cleanup inside Bubblewrap and Seccomp
         shell: bash
         run: |
           set -euo pipefail
@@ -159,12 +164,12 @@ jobs:
             "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
             "$VEDA_STAGE" "$(readlink /proc/self/ns/net)" \
             /usr/bin/python3 -S /tmp/work/veda_g15_escape_group_negative_qa.py
-          echo "NEGATIVE TEST COMPLETE. No assertion of safe process-tree enforcement."
+          echo "ESCAPE REGRESSION EXECUTED. Kernel cgroup process-tree enforcement remains HOLD."
           {
             echo '## VEDA G1.5 Detached Group Negative QA'
             echo '| Gate | Result |'
             echo '|---|---|'
-            echo '| Escaping-child behavior | Check logs; expected reproduction is a vulnerability |'
+            echo '| Escaping-child behavior | Must detect orphan descendants and clean up |'
             echo '| Cleanup of bounded synthetic child | Required |'
             echo '| Kernel cgroup v2 enforcement | HOLD |'
             echo '| Trust G0 | HOLD |'
