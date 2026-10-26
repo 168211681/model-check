@@ -44,8 +44,9 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          timeout 15s bwrap --unshare-all --die-with-parent \
+          timeout 15s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp \
             -- /usr/bin/true >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
           status=$?
           set -e
@@ -54,7 +55,7 @@ jobs:
             sed -n '1,40p' "$RUNNER_TEMP/bwrap-preflight.log"
             exit "$status"
           fi
-          echo "Bubblewrap namespace isolation available."
+          echo "Bubblewrap full namespace isolation available with unprivileged sandbox UID."
 
       - name: Checkout pinned upstream llama.cpp without checkout action
         shell: bash
@@ -93,8 +94,9 @@ jobs:
           output="$RUNNER_TEMP/veda-native-output.txt"
           diagnostics="$RUNNER_TEMP/veda-native-diagnostics.txt"
           set +e
-          timeout 120s bwrap --unshare-all --die-with-parent \
+          timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --uid 65534 --gid 65534 --clearenv \
             --setenv HOME /tmp --chdir "$PWD" \
             "$PWD/llama-src/build/bin/llama-completion" \
             --model "$PWD/native-model.gguf" \
