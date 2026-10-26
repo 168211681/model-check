@@ -1,0 +1,192 @@
+name: "VEDA G1.5 App Supervisor synthetic sandbox (model-check only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g15-process-supervisor.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g15-app-supervisor
+  cancel-in-progress: false
+
+jobs:
+  synthetic-supervisor:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Scope and no-write preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          echo "VEDA G1.5 supervisor: public Standard runner, read-only token, synthetic-only, no cgroup writes."
+          echo "GOVERNANCE: Trust G0 HOLD, no canonical source/deploy/production."
+
+      - name: Install Ubuntu packages for sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap libseccomp2 git ca-certificates
+          command -v bwrap
+
+      - name: Fetch pinned revision of public model-check source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q verify-source
+          git -C verify-source remote add origin https://github.com/168211681/model-check.git
+          git -C verify-source fetch --depth 1 origin "$GITHUB_SHA"
+          git -C verify-source checkout -q --detach FETCH_HEAD
+          test "$(git -C verify-source rev-parse HEAD)" = "$GITHUB_SHA"
+          test -r verify-source/tools/veda_g15_process_supervisor.py
+          test -r verify-source/tools/veda_g15_supervisor_qa.py
+          python3 -S -m py_compile verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py
+          sha256sum verify-source/tools/veda_g15_process_supervisor.py verify-source/tools/veda_g15_supervisor_qa.py
+
+      - name: Generate Seccomp BPF and restricted launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/g13-filter.py" <<'PY'
+          import ctypes, ctypes.util, errno, os, platform, sys
+          assert platform.machine() == "x86_64", "unexpected architecture"
+          name = ctypes.util.find_library("seccomp")
+          assert name, "libseccomp missing"
+          lib = ctypes.CDLL(name, use_errno=True)
+          lib.seccomp_init.argtypes = [ctypes.c_uint32]
+          lib.seccomp_init.restype = ctypes.c_void_p
+          lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+          lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+          lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+          lib.seccomp_rule_add.restype = ctypes.c_int
+          lib.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+          lib.seccomp_export_bpf.restype = ctypes.c_int
+          lib.seccomp_release.argtypes = [ctypes.c_void_p]
+          lib.seccomp_release.restype = None
+          deny = (
+              "socket", "socketpair", "ptrace", "mount", "umount2", "setns",
+              "unshare", "bpf", "perf_event_open", "keyctl", "add_key",
+              "request_key", "kexec_load", "finit_module", "init_module",
+              "delete_module", "process_vm_readv", "process_vm_writev",
+              "userfaultfd", "open_by_handle_at", "reboot", "swapon", "swapoff",
+              "io_uring_setup", "io_uring_enter", "io_uring_register", "pidfd_getfd",
+          )
+          # Default-ALLOW + explicit high-risk denial; not a full syscall allowlist.
+          ctx = lib.seccomp_init(0x7FFF0000)
+          assert ctx, "seccomp_init failed"
+          try:
+              for syscall in deny:
+                  nr = lib.seccomp_syscall_resolve_name(syscall.encode("ascii"))
+                  assert nr >= 0, f"unresolved syscall {syscall}"
+                  rc = lib.seccomp_rule_add(ctx, 0x00050000 | errno.EPERM, nr, 0)
+                  assert rc == 0, f"failed filter rule {syscall}: {rc}"
+              with open(sys.argv[1], "wb") as out:
+                  rc = lib.seccomp_export_bpf(ctx, out.fileno())
+                  assert rc == 0, f"BPF export failed: {rc}"
+          finally:
+              lib.seccomp_release(ctx)
+          size = os.stat(sys.argv[1]).st_size
+          assert size >= 128 and size % 8 == 0, "invalid BPF length"
+          print(f"G1.3 SECCOMP BPF READY: {len(deny)} denied syscalls; {size} bytes")
+          PY
+          cat > "$RUNNER_TEMP/g13-launch.py" <<'PY'
+          import os, sys
+          if len(sys.argv) < 5:
+              raise SystemExit("invalid launcher arguments")
+          policy, stage, host_ns, *cmd = sys.argv[1:]
+          if not (stage.startswith("/tmp/veda-g1-stage.") and os.path.isdir(stage) and cmd):
+              raise SystemExit("invalid sandbox stage or command")
+          fd = os.open(policy, os.O_RDONLY)
+          os.dup2(fd, 3, inheritable=True)
+          if fd != 3:
+              os.close(fd)
+          os.set_inheritable(3, True)
+          args = [
+              "/usr/bin/bwrap", "--seccomp", "3",
+              "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+              "--tmpfs", "/",
+              "--ro-bind", "/usr", "/usr",
+              "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+              "--symlink", "usr/lib64", "/lib64",
+              "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+              "--dir", "/etc", "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
+              "--ro-bind", stage, "/tmp/work",
+              "--uid", "65534", "--gid", "65534", "--clearenv",
+              "--setenv", "HOME", "/tmp",
+              "--setenv", "HOST_NETNS", host_ns,
+              "--setenv", "LD_LIBRARY_PATH", "/tmp/work/bin",
+              "--chdir", "/tmp/work",
+              "--", *cmd
+          ]
+          # Limits are inherited by bubblewrap and the GGUF child. Fail closed on error.
+          # RLIMIT_AS is virtual address space, not a total host memory cgroup.
+          import resource
+          limits = {
+              resource.RLIMIT_CPU: 90,
+              resource.RLIMIT_AS: 3 * 1024 * 1024 * 1024,
+              resource.RLIMIT_FSIZE: 8 * 1024 * 1024,
+              resource.RLIMIT_NOFILE: 256,
+              resource.RLIMIT_NPROC: 128,
+              resource.RLIMIT_CORE: 0,
+          }
+          for key, value in limits.items():
+              resource.setrlimit(key, (value, value))
+          os.execv("/usr/bin/bwrap", args)
+          PY
+          /usr/bin/python3 "$RUNNER_TEMP/g13-filter.py" "$RUNNER_TEMP/g13-seccomp.bpf"
+          sha256sum "$RUNNER_TEMP/g13-seccomp.bpf"
+
+      - name: Stage source in disposable read-only sandbox directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d -p /tmp veda-g1-stage.XXXXXX)"
+          chmod 0755 "$stage"
+          cp verify-source/tools/veda_g15_process_supervisor.py "$stage/"
+          cp verify-source/tools/veda_g15_supervisor_qa.py "$stage/"
+          chmod 0644 "$stage"/*.py
+          printf 'VEDA_G15_STAGE=%s\n' "$stage" >> "$GITHUB_ENV"
+          test -s "$RUNNER_TEMP/g13-seccomp.bpf"
+          echo "G1.5 stage prepared with G1.4 27-syscall Seccomp filter."
+
+      - name: Run bounded synthetic QA inside Bubblewrap + Seccomp
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VEDA_G15_STAGE"
+          timeout 85s sudo --non-interactive /usr/bin/python3 \
+            "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+            "$VEDA_G15_STAGE" "$(readlink /proc/self/ns/net)" \
+            /usr/bin/env VEDA_G15_EXPECT_SANDBOX=1 \
+            /usr/bin/python3 -S /tmp/work/veda_g15_supervisor_qa.py
+          echo "VEDA G1.5 SUPERVISOR SYNTHETIC PASS, cgroup v2 enforcement remains HOLD"
+          {
+            echo '## VEDA G1.5 Application Supervisor'
+            echo '| Check | Result |'
+            echo '|---|---|'
+            echo '| Bounded memory/process/timeout/crash synthetic tests | PASS if step succeeds |'
+            echo '| Per-process child cleanup and deterministic output | PASS if step succeeds |'
+            echo '| Seccomp and Bubblewrap security | PASS if step succeeds |'
+            echo '| cgroup v2 process-tree enforcement | HOLD / not tested |'
+            echo '| Trust G0 | HOLD unchanged |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report scope and limitations
+        if: always()
+        shell: bash
+        run: |
+          echo "REPO: $GITHUB_REPOSITORY"
+          echo "G1.5 ONLY: application-level best-effort supervisor, not a kernel enforcement control"
+          echo "NO cgroup writes, no secrets, no deploy, no production, no Canonical Source changes"
