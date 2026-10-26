@@ -1,0 +1,173 @@
+name: "VEDA G1.6 Unified Supervisor Seccomp Kernel GGUF E2E"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-unified-supervisor-seccomp-kernel-gguf.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g16-unified-native
+  cancel-in-progress: false
+
+jobs:
+  unified-sandbox-native:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    container:
+      image: ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c
+      options: >-
+        --memory=768m
+        --memory-swap=768m
+        --pids-limit=48
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --user=65534:65534
+    env:
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+      OFFICIAL_IMAGE_OUTPUT_SHA256: 30f90e7d02725db7a7ab0d740ad3bbcd276876dc9ad5994b50d626469dbbcbb7
+      G15_SUPERVISOR_SHA256: b48f1fe8c5567bb4b4e23feb618c54f5aa5a3d0d85211d0324c2b5fbe9fac65e
+    steps:
+      - name: Fail-closed scope, identity, cgroup and Docker socket preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = refs/heads/main
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          test "$(id -u)" = 65534
+          test "$(id -g)" = 65534
+          test "$(cat /sys/fs/cgroup/memory.max)" = 805306368
+          test "$(cat /sys/fs/cgroup/pids.max)" = 48
+          test "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = 0000000000000000
+          test "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = 1
+          test ! -r /var/run/docker.sock
+          test ! -w /var/run/docker.sock
+          test -x /app/llama-completion
+          test -x /usr/bin/python3
+          test -r /usr/lib/x86_64-linux-gnu/libseccomp.so.2
+          echo "G1.6 UNIFIED_SCOPE=PASS"
+          echo "G1.6 UNIFIED_KERNEL_MEMORY_MAX=805306368"
+          echo "G1.6 UNIFIED_KERNEL_PIDS_MAX=48"
+          echo "G1.6 UNIFIED_NONROOT_CAPS=NONE"
+          echo "G1.6 UNIFIED_DOCKER_SOCKET_INACCESSIBLE=PASS"
+          echo "G1.6 UNIFIED_CGROUP_WRITES=NONE"
+          echo "G1.6 ROOTLESS_DELEGATION=NOT_TESTED"
+          echo "G1.6 TRUST_G0=HOLD"
+
+      - name: Retrieve and verify exact G1.5 process supervisor and G1.6 seccomp launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/veda_g16_combined
+          for file in veda_g15_process_supervisor.py veda_g16_seccomp_exec.py; do
+            curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
+              --output "/tmp/veda_g16_combined/$file" \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/$file"
+            test -s "/tmp/veda_g16_combined/$file"
+          done
+          printf '%s  %s\n' "$G15_SUPERVISOR_SHA256" \
+            /tmp/veda_g16_combined/veda_g15_process_supervisor.py | sha256sum --check --status
+          /usr/bin/python3 -S -m py_compile \
+            /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+            /tmp/veda_g16_combined/veda_g16_seccomp_exec.py
+          sha256sum /tmp/veda_g16_combined/*.py
+          echo "G1.6 UNIFIED_SOURCE_INTEGRITY=PASS"
+
+      - name: Verify seccomp inherited across exec under the original G1.5 supervisor
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+            --max-rss-mb 200 --max-as-mb 3072 --max-processes 4 --timeout-s 12 -- \
+            /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g16_seccomp_exec.py \
+            --post-exec-selftest > /tmp/veda_g16_combined/negative-control.jsonl
+          /usr/bin/python3 -S - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("/tmp/veda_g16_combined/negative-control.jsonl").read_text().splitlines()
+          records=[json.loads(line.split("VEDA_SUPERVISOR_RESULT=",1)[1])
+                   for line in lines if line.startswith("VEDA_SUPERVISOR_RESULT=")]
+          assert len(records)==1, "BLOCKED: missing supervisor record"
+          r=records[0]
+          assert r["decision"]=="exit_0" and r["child_exit"]==0 and r["alive_group_after"]==0, r
+          assert "G1.6 SECCOMP_PERSISTED_ACROSS_EXEC=PASS" in r["stdout_excerpt"], r
+          assert "G1.6 SECCOMP_POLICY_LOADED=27_DENIED_SYSCALLS" in r["stderr_excerpt"], r
+          print("G1.6 UNIFIED_SECCOMP_27_DENIED=PASS")
+          print("G1.6 UNIFIED_SECCOMP_SURVIVES_EXEC=PASS")
+          print("G1.6 UNIFIED_G15_PROCESS_SUPERVISOR_NEGATIVE_QA=PASS")
+          PY
+
+      - name: Download SHA256-pinned GGUF outside the supervised offline inference process
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 \
+            --output /tmp/veda_g16_combined/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" /tmp/veda_g16_combined/model.gguf | sha256sum --check --status
+          test "$(stat -c %s /tmp/veda_g16_combined/model.gguf)" -gt 10000000
+          chmod 0400 /tmp/veda_g16_combined/model.gguf
+          echo "G1.6 UNIFIED_PINNED_GGUF=PASS"
+
+      - name: GGUF Native inference twice under G1.5 supervisor, 27 Seccomp rules, kernel cgroups
+        shell: bash
+        run: |
+          set -euo pipefail
+          initial_oom="$(awk '$1=="oom_kill"{print $2}' /sys/fs/cgroup/memory.events)"
+          initial_pids="$(awk '$1=="max"{print $2}' /sys/fs/cgroup/pids.events)"
+          for attempt in 1 2; do
+            /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g15_process_supervisor.py \
+              --max-rss-mb 600 --max-as-mb 3072 --max-processes 8 --timeout-s 55 -- \
+              /usr/bin/python3 -S /tmp/veda_g16_combined/veda_g16_seccomp_exec.py \
+              -- /app/llama-completion \
+              --model /tmp/veda_g16_combined/model.gguf \
+              --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
+              --n-predict 24 --ctx-size 256 --threads 2 \
+              --temp 0 --seed 42 --no-display-prompt --no-conversation \
+              > "/tmp/veda_g16_combined/native-$attempt.jsonl"
+            /usr/bin/python3 -S - "/tmp/veda_g16_combined/native-$attempt.jsonl" "$attempt" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          lines=Path(sys.argv[1]).read_text().splitlines()
+          records=[json.loads(line.split("VEDA_SUPERVISOR_RESULT=",1)[1])
+                   for line in lines if line.startswith("VEDA_SUPERVISOR_RESULT=")]
+          assert len(records)==1, f"BLOCKED: missing supervisor record attempt={sys.argv[2]}"
+          r=records[0]
+          assert r["decision"]=="exit_0" and r["child_exit"]==0 and r["alive_group_after"]==0, r
+          assert "Paris" in r["stdout_excerpt"], f"BLOCKED: native semantic missing: {r}"
+          assert "SECCOMP_POLICY_LOADED=27_DENIED_SYSCALLS" in r["stderr_excerpt"], f"BLOCKED: seccomp not proven: {r}"
+          assert r["stdout_sha256"]==os.environ["OFFICIAL_IMAGE_OUTPUT_SHA256"], f"BLOCKED: output drift {r['stdout_sha256']}"
+          assert r["max_observed_processes"]<=8, r
+          assert r["max_observed_rss_bytes"] < 600*1024*1024, r
+          print("G1.6 UNIFIED_NATIVE_ATTEMPT_"+sys.argv[2]+"=PASS")
+          print("G1.6 UNIFIED_NATIVE_SHA256_"+sys.argv[2]+"="+r["stdout_sha256"])
+          print("G1.6 UNIFIED_NATIVE_OBSERVED_RSS_BYTES_"+sys.argv[2]+"="+str(r["max_observed_rss_bytes"]))
+          PY
+          done
+          final_oom="$(awk '$1=="oom_kill"{print $2}' /sys/fs/cgroup/memory.events)"
+          final_pids="$(awk '$1=="max"{print $2}' /sys/fs/cgroup/pids.events)"
+          test "$final_oom" = "$initial_oom"
+          test "$final_pids" = "$initial_pids"
+          echo "G1.6 UNIFIED_NATIVE_NO_OOM_OR_PID_LIMIT_EVENTS=PASS"
+          echo "G1.6 UNIFIED_SUPERVISOR_SECCOMP_KERNEL_NATIVE_E2E=PASS"
+          echo "G1.6 ROOTLESS_DELEGATION_E2E=NOT_RUN"
+          echo "G1.6 TRUST_G0=HOLD"
+
+      - name: Always report governance hold and container boundaries
+        if: always()
+        shell: bash
+        run: |
+          echo "G1.6 combined QA only: G1.5 Supervisor + 27 Seccomp-denied syscalls + GitHub-managed kernel cgroups."
+          echo "No bubblewrap inside container, no rootless delegated subtree, no direct cgroup writes."
+          echo "No sudo, no privileged container, no Production, no Canonical Source or Governance changes."
+          echo "Trust G0 HOLD."
