@@ -39,6 +39,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends bubblewrap ninja-build cmake g++ git ca-certificates curl
           command -v bwrap
 
+      - name: Bubblewrap isolation preflight (fail closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout 15s bwrap --unshare-all --die-with-parent \
+            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            -- /usr/bin/true >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 0; then
+            echo "Bubblewrap preflight denied (exit $status); no unsandboxed fallback."
+            sed -n '1,40p' "$RUNNER_TEMP/bwrap-preflight.log"
+            exit "$status"
+          fi
+          echo "Bubblewrap namespace isolation available."
+
       - name: Checkout pinned upstream llama.cpp without checkout action
         shell: bash
         run: |
@@ -75,6 +92,7 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/veda-native-output.txt"
           diagnostics="$RUNNER_TEMP/veda-native-diagnostics.txt"
+          set +e
           timeout 120s bwrap --unshare-all --die-with-parent \
             --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
             --setenv HOME /tmp --chdir "$PWD" \
@@ -84,7 +102,18 @@ jobs:
             --n-predict 24 --ctx-size 256 --threads 2 \
             --temp 0 --no-display-prompt --no-conversation \
             >"$output" 2>"$diagnostics"
-          test -s "$output"
+          status=$?
+          set -e
+          if test "$status" -ne 0; then
+            echo "Native inference failed (exit $status); no unsandboxed fallback."
+            sed -n '1,60p' "$diagnostics"
+            exit "$status"
+          fi
+          if ! test -s "$output"; then
+            echo "Native inference exited 0 but output was empty."
+            sed -n '1,60p' "$diagnostics"
+            exit 1
+          fi
           echo "Native GGUF E2E PASS: sandboxed CPU inference emitted output."
           echo "Output bytes: $(wc -c < "$output")"
           echo "No content uploaded; local temporary files expire with runner."
