@@ -1,0 +1,53 @@
+name: "VEDA G1.6 Combined Runtime Capability Read-only Probe"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-combined-runtime-probe.yml
+permissions:
+  contents: read
+jobs:
+  inventory:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    container:
+      image: ghcr.io/ggml-org/llama.cpp:light@sha256:d1dac5128905d21f2ef7306a3bcbd509ef50dbe5b5b91c5f2812dd0d6f859b2c
+      options: >-
+        --memory=768m
+        --memory-swap=768m
+        --pids-limit=48
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --user=65534:65534
+    steps:
+      - name: Read-only executable and isolation inventory
+        shell: sh
+        run: |
+          set -eu
+          test "$GITHUB_REPOSITORY" = '168211681/model-check'
+          test "$(id -u)" = 65534
+          test "$(cat /sys/fs/cgroup/memory.max)" = 805306368
+          test "$(cat /sys/fs/cgroup/pids.max)" = 48
+          echo 'G1.6_COMBINED_RUNTIME_INVENTORY_BEGIN'
+          for executable in python3 python gcc cc clang go node bash sh curl wget tar gzip busybox bwrap unshare setpriv prlimit capsh sha256sum; do
+            if command -v "$executable" >/dev/null 2>&1; then
+              printf 'HAS_%s=%s\n' "$executable" "$(command -v "$executable")"
+            else
+              printf 'HAS_%s=NO\n' "$executable"
+            fi
+          done
+          for path in /usr/bin/python3 /usr/local/bin/python3 /usr/lib/x86_64-linux-gnu/libseccomp.so.2 /usr/lib/libseccomp.so.2 /app/llama-completion /var/run/docker.sock; do
+            if test -e "$path"; then
+              printf 'PATH_PRESENT=%s\n' "$path"
+            else
+              printf 'PATH_ABSENT=%s\n' "$path"
+            fi
+          done
+          if test -r /etc/os-release; then sed -n '1,8p' /etc/os-release; fi
+          test ! -r /var/run/docker.sock
+          test ! -w /var/run/docker.sock
+          echo 'G1.6_COMBINED_RUNTIME_INVENTORY_END'
+          echo 'G1.6_TRUST_G0=HOLD'
