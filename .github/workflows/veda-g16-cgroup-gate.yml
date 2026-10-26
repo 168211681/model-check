@@ -1,0 +1,86 @@
+name: "VEDA G1.6 cgroup v2 delegated hard-limit readiness (model-check only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-cgroup-gate.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g16-cgroup2-readiness
+  cancel-in-progress: false
+
+jobs:
+  delegated-readiness:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate no-write public standard runner scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "168211681/model-check"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RUNNER_OS" = "Linux"
+          test "$RUNNER_ARCH" = "X64"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          echo "G1.6 PREFLIGHT PASS: scope model-check only, read-only GITHUB_TOKEN, standard runner"
+          echo "No sudo, no cgroup writes, no deploy, no billing, no canonical changes"
+          echo "Trust G0 = HOLD"
+
+      - name: Fetch exact public source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q probe-source
+          git -C probe-source remote add origin https://github.com/168211681/model-check.git
+          git -C probe-source fetch --depth 1 origin "$GITHUB_SHA"
+          git -C probe-source checkout -q --detach FETCH_HEAD
+          test "$(git -C probe-source rev-parse HEAD)" = "$GITHUB_SHA"
+          test -r probe-source/tools/veda_g16_cgroup_v2_gate.py
+          python3 -S -m py_compile probe-source/tools/veda_g16_cgroup_v2_gate.py
+          sha256sum probe-source/tools/veda_g16_cgroup_v2_gate.py
+
+      - name: Fail-closed synthetic delegation logic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -S probe-source/tools/veda_g16_cgroup_v2_gate.py --selftest
+          echo "G1.6 GATE SELFTEST PASS"
+
+      - name: Read-only real kernel cgroup delegation probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -S probe-source/tools/veda_g16_cgroup_v2_gate.py --probe > "$RUNNER_TEMP/g16-cgroup-readiness.json"
+          python3 - "$RUNNER_TEMP/g16-cgroup-readiness.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert data["decision"] in ("BLOCKED", "ELIGIBLE_UNVERIFIED")
+          print("G1.6 READONLY REAL DELEGATION=" + data["decision"])
+          print("G1.6 BLOCKERS=" + (",".join(data["reasons"]) or "none"))
+          print("G1.6 CONTROLLERS=" + ",".join(data["controllers"]))
+          print("G1.6 SUBTREE_ENABLED=" + ",".join(data["subtree_enabled"]))
+          print("G1.6 NO_CGROUP_WRITES=CONFIRMED")
+          print("G1.6 KERNEL_MEMORY_PIDS_E2E=NOT_RUN")
+          print("G1.6 TRUST_G0=HOLD")
+          with open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("## VEDA G1.6 read-only cgroup2 readiness\n")
+              f.write(f"- Readiness: **{data['decision']}**\n")
+              f.write(f"- Blocking reasons: **{', '.join(data['reasons']) or 'none'}**\n")
+              f.write("- Kernel memory.max / pids.max E2E: **NOT RUN**\n")
+              f.write("- cgroup control writes: **NONE**\n")
+              f.write("- Trust G0: **HOLD**\n")
+          PY
+
+      - name: Final bounded lab status
+        if: always()
+        shell: bash
+        run: |
+          echo "G1.6 only cgroup read-only readiness; no production, no governance, no deployment"
