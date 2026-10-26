@@ -38,6 +38,17 @@ def worker(mode: str) -> None:
         gc.collect()
         time.sleep(0.40)
         return
+    if mode == "hard_as":
+        # A short 160 MiB allocation attempt under 128 MiB RLIMIT_AS must
+        # fail at the kernel even if it occurs between RSS samples.
+        try:
+            transient = _touch(160 * MiB)
+        except MemoryError:
+            print("STRESS_HARD_AS_REJECTED: 160 MiB denied by 128 MiB RLIMIT_AS", flush=True)
+            return
+        else:
+            del transient
+            raise AssertionError("160 MiB allocated despite 128 MiB virtual address ceiling")
     if mode == "rapid_fork":
         # Six processes maximum (one leader plus five short-lived children).
         children = []
@@ -89,19 +100,21 @@ def run() -> int:
 
     # Each subprocess has an independent subprocess group; the QA parent
     # remains in an isolated Bubblewrap PID namespace.
+    # (mode, expected, RSS MiB, max pids, timeout, poll, per-process AS MiB)
     cases = (
-        ("control", "exit_0", 72, 8, 2.5, 0.025),
-        ("control", "exit_0", 72, 8, 2.5, 0.025),
-        ("pulse_sustained", "max_rss", 48, 8, 2.5, 0.025),
-        ("rapid_fork", "max_processes", 120, 3, 2.5, 0.025),
-        ("nested_detach", "orphan_descendants", 120, 8, 2.5, 0.025),
-        ("pulse_short", "diagnostic", 48, 8, 2.5, 0.1),
+        ("control", "exit_0", 72, 8, 2.5, 0.025, 3072),
+        ("control", "exit_0", 72, 8, 2.5, 0.025, 3072),
+        ("pulse_sustained", "max_rss", 48, 8, 2.5, 0.025, 3072),
+        ("rapid_fork", "max_processes", 120, 3, 2.5, 0.025, 3072),
+        ("nested_detach", "orphan_descendants", 120, 8, 2.5, 0.025, 3072),
+        ("pulse_short", "diagnostic", 48, 8, 2.5, 0.1, 3072),
+        ("hard_as", "exit_0", 48, 8, 2.5, 0.025, 128),
     )
     hashes = []
-    for mode, expected, rss, nproc, timeout, poll in cases:
+    for mode, expected, rss, nproc, timeout, poll, max_as in cases:
         result = supervise([sys.executable, "-S", __file__, "target", mode],
                            max_rss_mb=rss, max_processes=nproc,
-                           timeout_s=timeout, poll_s=poll)
+                           timeout_s=timeout, poll_s=poll, max_as_mb=max_as)
         try:
             assert result["alive_group_after"] == 0, f"orphan/leak after {mode}: {result}"
             assert result["decision"] != "monitor_error", f"monitor error on {mode}: {result}"
@@ -122,6 +135,9 @@ def run() -> int:
             elif mode == "pulse_short":
                 print("STRESS_SHORT_PULSE_OBSERVATION=" + result["decision"], flush=True)
                 print("STRESS_SHORT_PULSE_NOT_GUARANTEED: 2ms memory pulse is a diagnostic, not an enforcement pass", flush=True)
+            elif mode == "hard_as":
+                assert "STRESS_HARD_AS_REJECTED" in result["stdout_excerpt"], f"RLIMIT_AS hard guard missing: {result}"
+                print("STRESS_HARD_AS_PASS: sub-poll allocation rejected by kernel per-process address-space limit", flush=True)
             elif mode == "control":
                 hashes.append(result["stdout_sha256"])
                 print("STRESS_CONTROL_PASS=" + result["stdout_sha256"], flush=True)
@@ -135,7 +151,7 @@ def run() -> int:
                         os.kill(pid, signal.SIGKILL)
                     MARKER.unlink(missing_ok=True)
     assert len(hashes) == 2 and hashes[0] == hashes[1], "non-deterministic controls"
-    print("G1.5 STRESS QA PASS: sustained RSS, bounded burst, nested detach and controls", flush=True)
+    print("G1.5 STRESS QA PASS: sustained RSS, bounded burst, nested detach, hard RLIMIT_AS, controls", flush=True)
     print("G1.5 LIMITATION: short RSS spikes may escape sampling; RLIMIT_NPROC/cgroup v2 are NOT proven enforced", flush=True)
     print("G1.5 TRUST_G0=HOLD", flush=True)
     return 0
