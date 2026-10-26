@@ -2,11 +2,6 @@ name: "VEDA G1.5 App Supervisor synthetic sandbox (model-check only)"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g15-process-supervisor.yml
 
 permissions:
   contents: read
