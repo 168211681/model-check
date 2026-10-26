@@ -178,6 +178,28 @@ def _worker(mode: str) -> None:
         raise RuntimeError("unknown bounded worker")
 
 
+def validate_kernel_outcomes(pids_test: dict, pids_before: int, pids_after: int,
+                             memory_test: dict, memory_before: dict,
+                             memory_after: dict) -> dict:
+    """Pure evidence validator: fail closed unless BOTH kernel limits fired."""
+    if pids_test.get("rc") != 0 or "PIDS_KERNEL_REJECTED_EAGAIN" not in pids_test.get("stdout", ""):
+        raise AssertionError("pids child did not observe EAGAIN")
+    if pids_after <= pids_before:
+        raise AssertionError("pids.events:max did not increase")
+    if memory_test.get("rc") == 0 or "MEMORY_WORKER_SURVIVED_UNEXPECTEDLY" in memory_test.get("stdout", ""):
+        raise AssertionError("memory worker unexpectedly completed despite memory.max")
+    max_hit = memory_after.get("max", 0) - memory_before.get("max", 0)
+    oom_hit = memory_after.get("oom", 0) - memory_before.get("oom", 0)
+    kill_hit = memory_after.get("oom_kill", 0) - memory_before.get("oom_kill", 0)
+    if max_hit <= 0 or (oom_hit <= 0 and kill_hit <= 0):
+        raise AssertionError("memory.events did not confirm cgroup hard-limit pressure")
+    return {
+        "pids": {"result": "PASS", "worker": pids_test, "max_events_delta": pids_after - pids_before},
+        "memory": {"result": "PASS", "worker": memory_test,
+                   "max_delta": max_hit, "oom_delta": oom_hit, "oom_kill_delta": kill_hit},
+    }
+
+
 def _cleanup(subtree: Path) -> None:
     if not subtree.exists():
         return
@@ -228,28 +250,15 @@ def execute(parent: Path, acknowledged: str) -> dict:
         before_pids = _keyed(child / "pids.events").get("max", 0)
         pids_test = _spawn(child, "pids")
         after_pids = _keyed(child / "pids.events").get("max", 0)
-        if pids_test["rc"] != 0 or "PIDS_KERNEL_REJECTED_EAGAIN" not in pids_test["stdout"]:
-            raise AssertionError("pids child did not observe EAGAIN")
-        if after_pids <= before_pids:
-            raise AssertionError("pids.events:max did not increase")
         before_mem = _keyed(child / "memory.events")
         memory_test = _spawn(child, "memory")
         after_mem = _keyed(child / "memory.events")
-        # At memory.max, the kernel can OOM-kill or reject memory allocation.
-        # Require a kernel counter increase, not just a worker crash.
-        max_hit = after_mem.get("max", 0) - before_mem.get("max", 0)
-        oom_hit = after_mem.get("oom", 0) - before_mem.get("oom", 0)
-        kill_hit = after_mem.get("oom_kill", 0) - before_mem.get("oom_kill", 0)
-        if memory_test["rc"] == 0 or "MEMORY_WORKER_SURVIVED_UNEXPECTEDLY" in memory_test["stdout"]:
-            raise AssertionError("memory worker unexpectedly completed despite memory.max")
-        if max_hit <= 0 or (oom_hit <= 0 and kill_hit <= 0):
-            raise AssertionError("memory.events did not confirm cgroup hard-limit pressure")
-        evidence.update({
-            "pids": {"result": "PASS", "worker": pids_test, "max_events_delta": after_pids - before_pids},
-            "memory": {"result": "PASS", "worker": memory_test,
-                       "max_delta": max_hit, "oom_delta": oom_hit, "oom_kill_delta": kill_hit},
-            "gate": "KERNEL_CGROUP_V2_E2E_PASS_IN_DELEGATED_LAB",
-        })
+        # Require both worker failures and kernel event increments; event
+        # counters alone are insufficient to claim hard-limit enforcement.
+        evidence.update(validate_kernel_outcomes(
+            pids_test, before_pids, after_pids,
+            memory_test, before_mem, after_mem))
+        evidence["gate"] = "KERNEL_CGROUP_V2_E2E_PASS_IN_DELEGATED_LAB"
         return evidence
     finally:
         _cleanup(child)
