@@ -73,6 +73,15 @@ def inspect(parent: Path, current: Path | None = None, real: bool = True) -> dic
             failures.append("NOT_A_NONROOT_CGROUP_SUBTREE")
         if parent != current and parent not in current.parents:
             failures.append("NOT_OWN_PROCESS_ANCESTOR")
+        # A writable-looking path may still be on a read-only cgroup2 mount.
+        # Only an owned, already-delegated nonroot subtree is eligible.
+        try:
+            if os.statvfs(parent).f_flag & getattr(os, "ST_RDONLY", 1):
+                failures.append("CGROUP_FILESYSTEM_READ_ONLY")
+            if parent.stat().st_uid != os.geteuid():
+                failures.append("DELEGATED_SUBTREE_NOT_USER_OWNED")
+        except OSError:
+            failures.append("CGROUP_PARENT_STAT_FAILED")
     else:
         if current is None:
             raise ValueError("fixture requires current path")
@@ -231,6 +240,8 @@ def execute(parent: Path, acknowledged: str) -> dict:
         max_hit = after_mem.get("max", 0) - before_mem.get("max", 0)
         oom_hit = after_mem.get("oom", 0) - before_mem.get("oom", 0)
         kill_hit = after_mem.get("oom_kill", 0) - before_mem.get("oom_kill", 0)
+        if memory_test["rc"] == 0 or "MEMORY_WORKER_SURVIVED_UNEXPECTEDLY" in memory_test["stdout"]:
+            raise AssertionError("memory worker unexpectedly completed despite memory.max")
         if max_hit <= 0 or (oom_hit <= 0 and kill_hit <= 0):
             raise AssertionError("memory.events did not confirm cgroup hard-limit pressure")
         evidence.update({
