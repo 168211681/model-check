@@ -1,0 +1,195 @@
+name: "VEDA G1.7 Portable GGUF Unified Security E2E"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g17-unified-portable-e2e.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veda-g17-unified-portable
+  cancel-in-progress: false
+
+jobs:
+  single-portable-build:
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Build pinned portable CPU binary exactly once
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          for command in cmake ninja git gcc g++ sha256sum tar; do command -v "$command"; done
+          git init -q src
+          git -C src remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C src fetch --depth 1 origin 224d94c02b502470071921da10e8bcee1160d539
+          git -C src checkout -q --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = 224d94c02b502470071921da10e8bcee1160d539
+          cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_CPU_REPACK=OFF \
+            -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_AVX512=OFF \
+            -DGGML_AVX_VNNI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF \
+            -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_SSE42=OFF -DGGML_BMI2=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+          for flag in GGML_NATIVE GGML_CPU_ALL_VARIANTS GGML_AVX GGML_AVX2 GGML_AVX512 GGML_FMA GGML_F16C GGML_SSE42 GGML_BMI2; do
+            grep -q "^$flag:BOOL=OFF$" src/build/CMakeCache.txt
+          done
+          cmake --build src/build --target llama-completion --parallel 3
+          test -x src/build/bin/llama-completion
+          tar -C src/build/bin -czf veda-g17-cpu-generic.tar.gz .
+          sha256sum veda-g17-cpu-generic.tar.gz > veda-g17-cpu-generic.tar.gz.sha256
+          echo "G1.7 SAME_BINARY_GENERATION=PASS"
+          sha256sum src/build/bin/llama-completion
+          echo "G1.7 TRUST_G0=HOLD"
+
+      - name: Upload immutable single-build artifact with 1-day retention
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: veda-g17-portable-onebuild
+          path: |
+            veda-g17-cpu-generic.tar.gz
+            veda-g17-cpu-generic.tar.gz.sha256
+          retention-days: 1
+          if-no-files-found: error
+
+  replay-on-two-host-images:
+    if: github.repository == '168211681/model-check'
+    needs: single-portable-build
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-24.04, ubuntu-22.04]
+        slot: [1, 2, 3]
+    runs-on: "${{ matrix.host }}"
+    timeout-minutes: 9
+    env:
+      MODEL_URL: https://huggingface.co/ggml-org/SmolLM2-135M-GGUF/resolve/1076b85d135017971845b19b8d07df1479155988/SmolLM2-135M-Q4_K_M.gguf
+      MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
+    steps:
+      - name: Download exact uploaded CPU-generic binary, not a rebuild
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: veda-g17-portable-onebuild
+          path: artifact
+
+      - name: Detect Intel or selected AMD baseline before GGUF download
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          vendor="$(awk -F: '/^vendor_id/{gsub(/^[ \t]+/,"",$2); print $2;exit}' /proc/cpuinfo)"
+          cpu="$(awk -F: '/^model name/{gsub(/^[ \t]+/,"",$2); print $2;exit}' /proc/cpuinfo)"
+          test -n "$vendor"
+          echo "G1.7 INTEGRATED_VENDOR=$vendor"
+          echo "G1.7 INTEGRATED_CPU=$cpu"
+          echo "G1.7 INTEGRATED_HOST=${{ matrix.host }}-${{ matrix.slot }}"
+          if test "$vendor" = GenuineIntel || test "${{ matrix.slot }}" = 1; then
+            echo "RUN_UNIFIED=true" >> "$GITHUB_ENV"
+            echo "G1.7 INTEGRATED_SELECTED=YES"
+          else
+            echo "RUN_UNIFIED=false" >> "$GITHUB_ENV"
+            echo "G1.7 INTEGRATED_SELECTED=SCOUT_ONLY"
+          fi
+          echo "G1.7 TRUST_G0=HOLD"
+
+      - name: Verify artifact, CPU and pinned GGUF
+        if: env.RUN_UNIFIED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 168211681/model-check
+          test "$GITHUB_REF" = refs/heads/main
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          for command in docker curl tar sha256sum; do command -v "$command" >/dev/null; done
+          (cd artifact && sha256sum -c veda-g17-cpu-generic.tar.gz.sha256)
+          mkdir -p portable model
+          tar -xzf artifact/veda-g17-cpu-generic.tar.gz -C portable
+          test -x portable/llama-completion
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 --output model/model.gguf "$MODEL_URL"
+          printf '%s  %s\n' "$MODEL_SHA256" model/model.gguf | sha256sum --check --status
+          chmod -R a+rX portable model
+          echo "G1.7 HOST_OS=$RUNNER_OS"
+          echo "G1.7 CPU_VENDOR=$(awk -F: '/^vendor_id/{print $2;exit}' /proc/cpuinfo)"
+          echo "G1.7 CPU_MODEL=$(awk -F: '/^model name/{print $2;exit}' /proc/cpuinfo)"
+          echo "G1.7 SAME_BINARY_ARCHIVE_SHA256=$(sha256sum artifact/veda-g17-cpu-generic.tar.gz | awk '{print $1}')"
+          echo "G1.7 SAME_BINARY_EXE_SHA256=$(sha256sum portable/llama-completion | awk '{print $1}')"
+          echo "G1.7 MODEL_INTEGRITY=PASS"
+
+      - name: CPU-generic Native GGUF under G1.5 Supervisor, Seccomp and kernel hard limits
+        if: env.RUN_UNIFIED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filename in veda_g15_process_supervisor.py veda_g16_seccomp_exec.py; do
+            curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
+              --output "portable/$filename" "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/$filename"
+          done
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 90 \
+            --output g17-security-runner.py "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/tools/veda_g17_unified_portable_runner.py"
+          test -s g17-security-runner.py
+          sha256sum g17-security-runner.py
+          python3 -S -m py_compile g17-security-runner.py
+          python3 -S g17-security-runner.py \
+            --portable portable --model model/model.gguf \
+            --job "${{ matrix.host }}-${{ matrix.slot }}" \
+            --manifest g17-unified-portable-result.json
+          echo "G1.7 INTEGRATED_SECURE_RUN=PASS"
+
+      - name: Upload verified per-run manifests
+        if: env.RUN_UNIFIED == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: "g17-unified-result-${{ matrix.host }}-${{ matrix.slot }}"
+          path: g17-unified-portable-result.json
+          retention-days: 1
+          if-no-files-found: error
+
+  compare-integrated:
+    needs: replay-on-two-host-images
+    if: github.repository == '168211681/model-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Fetch full-security GGUF manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: g17-unified-result-*
+          path: all-evidence
+
+      - name: Assert same exact binary and result across selected CPUs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -S - <<'PY'
+          import json
+          from pathlib import Path
+          paths=sorted(Path("all-evidence").glob("*/g17-unified-portable-result.json"))
+          assert len(paths)>=2, "BLOCKED: no two independent successful secure runs"
+          docs=[json.loads(p.read_text()) for p in paths]
+          assert len(set(d["job"] for d in docs))==len(docs), "duplicate job evidence"
+          for k in ("binary_sha256","model_sha256","stdout_sha256","source_seccomp_sha256","source_supervisor_sha256"):
+              assert len({d[k] for d in docs})==1, f"BLOCKED: output/integrity drift in {k}"
+          assert all(d["inferences"]==4 and d["trust_g0"]=="HOLD" for d in docs)
+          assert docs[0]["stdout_sha256"]=="d7a3611195b24f1246701c68beaa1a3a641b4b759607a45bb837b36294461c53"
+          vendors={d["cpu_vendor"] for d in docs}
+          print("G1.7 INTEGRATED_VERIFIED_JOBS="+str(len(docs)))
+          print("G1.7 INTEGRATED_VERIFIED_INFERENCES="+str(4*len(docs)))
+          print("G1.7 INTEGRATED_CPU_VENDORS="+",".join(sorted(vendors)))
+          print("G1.7 INTEGRATED_NATIVE_STDOUT_SHA256="+docs[0]["stdout_sha256"])
+          if {"AuthenticAMD","GenuineIntel"}.issubset(vendors):
+              print("G1.7 CPU_GENERIC_UNIFIED_CROSS_VENDOR=PASS_OBSERVED_SCOPE")
+          else:
+              print("G1.7 CPU_GENERIC_UNIFIED_CROSS_VENDOR=HOLD_NO_INTEL_OR_AMD")
+          print("G1.7 ROOTLESS_DELEGATION=NOT_TESTED")
+          print("G1.7 TRUST_G0=HOLD")
+          PY
