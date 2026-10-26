@@ -2,6 +2,11 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          if test "$GITHUB_EVENT_NAME" = push; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -36,10 +44,89 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap ninja-build cmake g++ git ca-certificates curl
+          sudo apt-get install -y --no-install-recommends bubblewrap libseccomp2 ninja-build cmake g++ git ca-certificates curl
           command -v bwrap
 
-      - name: Bubblewrap isolation preflight (fail closed)
+      - name: Generate Seccomp BPF and restricted launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/g13-filter.py" <<'PY'
+          import ctypes, ctypes.util, errno, os, platform, sys
+          assert platform.machine() == "x86_64", "unexpected architecture"
+          name = ctypes.util.find_library("seccomp")
+          assert name, "libseccomp missing"
+          lib = ctypes.CDLL(name, use_errno=True)
+          lib.seccomp_init.argtypes = [ctypes.c_uint32]
+          lib.seccomp_init.restype = ctypes.c_void_p
+          lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+          lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+          lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+          lib.seccomp_rule_add.restype = ctypes.c_int
+          lib.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+          lib.seccomp_export_bpf.restype = ctypes.c_int
+          lib.seccomp_release.argtypes = [ctypes.c_void_p]
+          lib.seccomp_release.restype = None
+          deny = (
+              "socket", "socketpair", "ptrace", "mount", "umount2", "setns",
+              "unshare", "bpf", "perf_event_open", "keyctl", "add_key",
+              "request_key", "kexec_load", "finit_module", "init_module",
+              "delete_module", "process_vm_readv", "process_vm_writev",
+              "userfaultfd", "open_by_handle_at", "reboot", "swapon", "swapoff",
+          )
+          # Default-ALLOW + explicit high-risk denial; not a full syscall allowlist.
+          ctx = lib.seccomp_init(0x7FFF0000)
+          assert ctx, "seccomp_init failed"
+          try:
+              for syscall in deny:
+                  nr = lib.seccomp_syscall_resolve_name(syscall.encode("ascii"))
+                  assert nr >= 0, f"unresolved syscall {syscall}"
+                  rc = lib.seccomp_rule_add(ctx, 0x00050000 | errno.EPERM, nr, 0)
+                  assert rc == 0, f"failed filter rule {syscall}: {rc}"
+              with open(sys.argv[1], "wb") as out:
+                  rc = lib.seccomp_export_bpf(ctx, out.fileno())
+                  assert rc == 0, f"BPF export failed: {rc}"
+          finally:
+              lib.seccomp_release(ctx)
+          size = os.stat(sys.argv[1]).st_size
+          assert size >= 128 and size % 8 == 0, "invalid BPF length"
+          print(f"G1.3 SECCOMP BPF READY: {len(deny)} denied syscalls; {size} bytes")
+          PY
+          cat > "$RUNNER_TEMP/g13-launch.py" <<'PY'
+          import os, sys
+          if len(sys.argv) < 5:
+              raise SystemExit("invalid launcher arguments")
+          policy, stage, host_ns, *cmd = sys.argv[1:]
+          if not (stage.startswith("/tmp/veda-g1-stage.") and os.path.isdir(stage) and cmd):
+              raise SystemExit("invalid sandbox stage or command")
+          fd = os.open(policy, os.O_RDONLY)
+          os.dup2(fd, 3, inheritable=True)
+          if fd != 3:
+              os.close(fd)
+          os.set_inheritable(3, True)
+          args = [
+              "/usr/bin/bwrap", "--seccomp", "3",
+              "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+              "--tmpfs", "/",
+              "--ro-bind", "/usr", "/usr",
+              "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+              "--symlink", "usr/lib64", "/lib64",
+              "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+              "--dir", "/etc", "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
+              "--ro-bind", stage, "/tmp/work",
+              "--uid", "65534", "--gid", "65534", "--clearenv",
+              "--setenv", "HOME", "/tmp",
+              "--setenv", "HOST_NETNS", host_ns,
+              "--setenv", "LD_LIBRARY_PATH", "/tmp/work/bin",
+              "--chdir", "/tmp/work",
+              "--", *cmd
+          ]
+          os.execv("/usr/bin/bwrap", args)
+          PY
+          /usr/bin/python3 "$RUNNER_TEMP/g13-filter.py" "$RUNNER_TEMP/g13-seccomp.bpf"
+          sha256sum "$RUNNER_TEMP/g13-seccomp.bpf"
+
+      - name: Seccomp-filtered Bubblewrap preflight (fail closed)
         shell: bash
         run: |
           set -euo pipefail
@@ -47,87 +134,67 @@ jobs:
           chmod 0755 "$stage_dir"
           printf 'VEDA_STAGE=%s\n' "$stage_dir" >> "$GITHUB_ENV"
           set +e
-          timeout 15s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-            --tmpfs / \
-            --ro-bind /usr /usr \
-            --symlink usr/bin /bin \
-            --symlink usr/lib /lib \
-            --symlink usr/lib64 /lib64 \
-            --dev /dev --proc /proc --tmpfs /tmp \
-            --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
-            --ro-bind "$stage_dir" /tmp/work \
-            --uid 65534 --gid 65534 --clearenv --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
-            -- /usr/bin/test -r /tmp/work >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
-          status=$?
+          timeout 15s sudo --non-interactive /usr/bin/python3 \
+            "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+            "$stage_dir" "$(readlink /proc/self/ns/net)" /usr/bin/test -r /tmp/work \
+            >"$RUNNER_TEMP/bwrap-preflight.log" 2>&1
+          result=$?
           set -e
-          if test "$status" -ne 0; then
-            echo "Bubblewrap preflight denied (exit $status); no unsandboxed fallback."
-            sed -n '1,40p' "$RUNNER_TEMP/bwrap-preflight.log"
-            exit "$status"
+          if test "$result" -ne 0; then
+            echo "Seccomp sandbox preflight failed ($result); no unsandboxed fallback"
+            sed -n '1,45p' "$RUNNER_TEMP/bwrap-preflight.log"
+            exit "$result"
           fi
-          echo "Bubblewrap full namespace isolation available with unprivileged sandbox UID."
+          echo "G1.3 SECCOMP PREFLIGHT PASS"
 
-      - name: Verify sandbox UID, read-only stage and blocked egress
+      - name: Seccomp denial and sandbox isolation negative tests
         shell: bash
         run: |
           set -euo pipefail
-          host_netns="$(readlink /proc/self/ns/net)"
-          cat > "$VEDA_STAGE/security_probe.py" <<'PY'
-          import errno
-          import os
-          import socket
-
-          assert os.geteuid() == 65534 and os.getegid() == 65534, "sandbox must run as nobody"
-          assert os.readlink("/proc/self/ns/net") != os.environ["HOST_NETNS"], "network namespace not isolated"
-          assert "GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ, "sensitive environment not cleared"
+          cat > "$VEDA_STAGE/g13_probe.py" <<'PY'
+          import errno, os, socket
+          assert os.geteuid() == 65534 and os.getegid() == 65534
+          assert os.readlink("/proc/self/ns/net") != os.environ["HOST_NETNS"]
+          assert "GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ
+          status = {}
+          with open("/proc/self/status", encoding="utf-8") as f:
+              for line in f:
+                  if ":" in line:
+                      key, value = line.split(":", 1)
+                      status[key] = value.strip()
+          assert status.get("Seccomp") == "2", f"seccomp mode {status.get('Seccomp')}"
+          assert int(status.get("CapEff", "-1"), 16) == 0, "effective caps not dropped"
           forbidden = ("/home", "/root", "/var", "/run", "/mnt", "/opt",
                        "/workspace", "/etc/passwd", "/etc/shadow", "/etc/hosts")
-          exposed = [p for p in forbidden if os.path.lexists(p)]
-          assert not exposed, f"unexpected host paths visible: {exposed}"
+          assert not [p for p in forbidden if os.path.lexists(p)], "host paths exposed"
           with open("/proc/self/mountinfo", encoding="utf-8") as f:
-              mountinfo = [line.split() for line in f]
-          roots = [m for m in mountinfo if m[4] == "/"]
-          runtimes = [m for m in mountinfo if m[4] == "/usr"]
-          assert len(roots) == 1 and roots[0][roots[0].index("-") + 1] == "tmpfs", "sandbox root is not disposable tmpfs"
-          assert len(runtimes) == 1 and "ro" in runtimes[0][5].split(","), "runtime /usr is not read-only"
-          assert os.path.isdir("/usr/lib"), "required runtime libraries missing"
-
-          with open("/proc/self/mountinfo", encoding="utf-8") as f:
-              mounts = [line.split() for line in f if line.split()[4] == "/tmp/work"]
-          assert len(mounts) == 1 and "ro" in mounts[0][5].split(","), "staged model mount not read-only"
+              entries = [line.split() for line in f]
+          root = [m for m in entries if m[4] == "/"]
+          usr = [m for m in entries if m[4] == "/usr"]
+          work = [m for m in entries if m[4] == "/tmp/work"]
+          assert len(root) == 1 and root[0][root[0].index("-")+1] == "tmpfs"
+          assert len(usr) == 1 and "ro" in usr[0][5].split(",")
+          assert len(work) == 1 and "ro" in work[0][5].split(",")
           try:
-              fd = os.open("/tmp/work/veda-no-write", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-          except OSError as exc:
-              assert exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM), f"unexpected write error: {exc}"
+              fd = os.open("/tmp/work/deny-write", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          except OSError as e:
+              assert e.errno in (errno.EPERM, errno.EACCES, errno.EROFS), e
           else:
               os.close(fd)
-              raise AssertionError("read-only stage was writable")
-          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-              sock.settimeout(3)
-              try:
-                  sock.connect(("1.1.1.1", 443))
-              except OSError as exc:
-                  assert getattr(exc, "errno", None) in (
-                      errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
-                      errno.EACCES, errno.EPERM,
-                  ), f"unexpected egress result: {exc!r}"
-              else:
-                  raise AssertionError("sandbox unexpectedly connected to the internet")
-          print("SECURITY PASS: root tmpfs, /usr ro, /tmp/work ro, sensitive host paths absent, UID=65534, netns isolated, egress blocked, env cleared")
+              raise AssertionError("read-only model stage writable")
+          try:
+              sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          except OSError as e:
+              assert e.errno == errno.EPERM, f"socket() not blocked by Seccomp: {e}"
+          else:
+              sock.close()
+              raise AssertionError("socket syscall unexpectedly permitted")
+          print("G1.3 SECURITY PASS: seccomp=2, socket() EPERM, caps=0, blocked egress, ro mounts, isolated netns")
           PY
-          chmod 0644 "$VEDA_STAGE/security_probe.py"
-          timeout 20s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-            --tmpfs / \
-            --ro-bind /usr /usr \
-            --symlink usr/bin /bin \
-            --symlink usr/lib /lib \
-            --symlink usr/lib64 /lib64 \
-            --dev /dev --proc /proc --tmpfs /tmp \
-            --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
-            --ro-bind "$VEDA_STAGE" /tmp/work \
-            --uid 65534 --gid 65534 --clearenv \
-            --setenv HOME /tmp --setenv HOST_NETNS "$host_netns" --chdir /tmp/work \
-            /usr/bin/python3 /tmp/work/security_probe.py
+          chmod 0644 "$VEDA_STAGE/g13_probe.py"
+          timeout 20s sudo --non-interactive /usr/bin/python3 \
+            "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+            "$VEDA_STAGE" "$(readlink /proc/self/ns/net)" /usr/bin/python3 /tmp/work/g13_probe.py
 
       - name: Checkout pinned upstream llama.cpp without checkout action
         shell: bash
@@ -159,7 +226,7 @@ jobs:
           test "$(stat -c %s native-model.gguf)" -gt 10000000
           echo "GGUF SHA-256 verified: $MODEL_SHA256"
 
-      - name: Native GGUF inference x2, semantic and deterministic validation
+      - name: Seccomp-protected GGUF inference x2, semantic and deterministic validation
         shell: bash
         run: |
           set -euo pipefail
@@ -173,17 +240,9 @@ jobs:
             output="$RUNNER_TEMP/veda-native-output-$attempt.txt"
             diagnostics="$RUNNER_TEMP/veda-native-diagnostics-$attempt.txt"
             set +e
-            timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-              --tmpfs / \
-              --ro-bind /usr /usr \
-              --symlink usr/bin /bin \
-              --symlink usr/lib /lib \
-              --symlink usr/lib64 /lib64 \
-              --dev /dev --proc /proc --tmpfs /tmp \
-              --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
-              --ro-bind "$VEDA_STAGE" /tmp/work \
-              --uid 65534 --gid 65534 --clearenv \
-              --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
+            timeout 120s sudo --non-interactive /usr/bin/python3 \
+              "$RUNNER_TEMP/g13-launch.py" "$RUNNER_TEMP/g13-seccomp.bpf" \
+              "$VEDA_STAGE" "$(readlink /proc/self/ns/net)" \
               /tmp/work/bin/llama-completion \
               --model /tmp/work/native-model.gguf \
               --prompt $'Capital city quiz:\nGermany: Berlin\nItaly: Rome\nSpain: Madrid\nFrance:' \
