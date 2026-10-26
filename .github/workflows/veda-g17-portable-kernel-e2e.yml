@@ -2,11 +2,6 @@ name: "VEDA G1.7 portable CPU build and kernel-capped cross-worker output"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g17-portable-kernel-e2e.yml
 
 permissions:
   contents: read
