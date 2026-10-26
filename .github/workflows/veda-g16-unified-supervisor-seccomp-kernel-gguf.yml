@@ -2,6 +2,11 @@ name: "VEDA G1.6 Unified Supervisor Seccomp Kernel GGUF E2E"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g16-unified-supervisor-seccomp-kernel-gguf.yml
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
       MODEL_SHA256: e3131339bf4e8065265593d4fd8f7bb7ff2d3abff1edb5618aa1197b89cad9f5
       OFFICIAL_IMAGE_OUTPUT_SHA256: 30f90e7d02725db7a7ab0d740ad3bbcd276876dc9ad5994b50d626469dbbcbb7
       G15_SUPERVISOR_SHA256: b48f1fe8c5567bb4b4e23feb618c54f5aa5a3d0d85211d0324c2b5fbe9fac65e
+      LD_LIBRARY_PATH: /app
     steps:
       - name: Fail-closed scope, identity, cgroup and Docker socket preflight
         shell: bash
