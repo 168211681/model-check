@@ -2,6 +2,11 @@ name: "VEDA G1 Native GGUF E2E (model-check only)"
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/veda-g1-native-gguf-e2e.yml
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "168211681/model-check"
-          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          case "$GITHUB_EVENT_NAME" in workflow_dispatch|push) ;; *) exit 1 ;; esac
+          if test "$GITHUB_EVENT_NAME" = push; then
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           echo "Scope: $GITHUB_REPOSITORY / standard ubuntu-24.04 / read-only token"
@@ -61,6 +69,50 @@ jobs:
           fi
           echo "Bubblewrap full namespace isolation available with unprivileged sandbox UID."
 
+      - name: Verify sandbox UID, read-only stage and blocked egress
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_netns="$(readlink /proc/self/ns/net)"
+          cat > "$VEDA_STAGE/security_probe.py" <<'PY'
+          import errno
+          import os
+          import socket
+
+          assert os.geteuid() == 65534 and os.getegid() == 65534, "sandbox must run as nobody"
+          assert os.readlink("/proc/self/ns/net") != os.environ["HOST_NETNS"], "network namespace not isolated"
+          assert "GITHUB_TOKEN" not in os.environ and "GH_TOKEN" not in os.environ, "sensitive environment not cleared"
+          with open("/proc/self/mountinfo", encoding="utf-8") as f:
+              mounts = [line.split() for line in f if line.split()[4] == "/tmp/work"]
+          assert len(mounts) == 1 and "ro" in mounts[0][5].split(","), "staged model mount not read-only"
+          try:
+              fd = os.open("/tmp/work/veda-no-write", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          except OSError as exc:
+              assert exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM), f"unexpected write error: {exc}"
+          else:
+              os.close(fd)
+              raise AssertionError("read-only stage was writable")
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+              sock.settimeout(3)
+              try:
+                  sock.connect(("1.1.1.1", 443))
+              except OSError as exc:
+                  assert getattr(exc, "errno", None) in (
+                      errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
+                      errno.EACCES, errno.EPERM,
+                  ), f"unexpected egress result: {exc!r}"
+              else:
+                  raise AssertionError("sandbox unexpectedly connected to the internet")
+          print("SECURITY PASS: UID/GID=65534, isolated netns, no external egress, staged mount ro, environment cleared")
+          PY
+          chmod 0644 "$VEDA_STAGE/security_probe.py"
+          timeout 20s sudo --non-interactive bwrap --unshare-all --die-with-parent \
+            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --ro-bind "$VEDA_STAGE" /tmp/work \
+            --uid 65534 --gid 65534 --clearenv \
+            --setenv HOME /tmp --setenv HOST_NETNS "$host_netns" --chdir /tmp/work \
+            /usr/bin/python3 /tmp/work/security_probe.py
+
       - name: Checkout pinned upstream llama.cpp without checkout action
         shell: bash
         run: |
@@ -91,44 +143,61 @@ jobs:
           test "$(stat -c %s native-model.gguf)" -gt 10000000
           echo "GGUF SHA-256 verified: $MODEL_SHA256"
 
-      - name: Native GGUF inference inside network-isolated bubblewrap
+      - name: Native GGUF inference x2, semantic and deterministic validation
         shell: bash
         run: |
           set -euo pipefail
-          output="$RUNNER_TEMP/veda-native-output.txt"
-          diagnostics="$RUNNER_TEMP/veda-native-diagnostics.txt"
           cp -a llama-src/build/bin "$VEDA_STAGE/bin"
           cp native-model.gguf "$VEDA_STAGE/native-model.gguf"
           chmod -R a+rX "$VEDA_STAGE"
           test -x "$VEDA_STAGE/bin/llama-completion"
           test -r "$VEDA_STAGE/native-model.gguf"
-          set +e
-          timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
-            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-            --ro-bind "$VEDA_STAGE" /tmp/work \
-            --uid 65534 --gid 65534 --clearenv \
-            --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
-            /tmp/work/bin/llama-completion \
-            --model /tmp/work/native-model.gguf \
-            --prompt "The capital of France is" \
-            --n-predict 24 --ctx-size 256 --threads 2 \
-            --temp 0 --no-display-prompt --no-conversation \
-            >"$output" 2>"$diagnostics"
-          status=$?
-          set -e
-          if test "$status" -ne 0; then
-            echo "Native inference failed (exit $status); no unsandboxed fallback."
-            sed -n '1,60p' "$diagnostics"
-            exit "$status"
-          fi
-          if ! test -s "$output"; then
-            echo "Native inference exited 0 but output was empty."
-            sed -n '1,60p' "$diagnostics"
+          for attempt in 1 2; do
+            output="$RUNNER_TEMP/veda-native-output-$attempt.txt"
+            diagnostics="$RUNNER_TEMP/veda-native-diagnostics-$attempt.txt"
+            set +e
+            timeout 120s sudo --non-interactive bwrap --unshare-all --die-with-parent \
+              --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+              --ro-bind "$VEDA_STAGE" /tmp/work \
+              --uid 65534 --gid 65534 --clearenv \
+              --setenv HOME /tmp --setenv LD_LIBRARY_PATH /tmp/work/bin --chdir /tmp/work \
+              /tmp/work/bin/llama-completion \
+              --model /tmp/work/native-model.gguf \
+              --prompt "The capital of France is" \
+              --n-predict 24 --ctx-size 256 --threads 2 \
+              --temp 0 --seed 42 --no-display-prompt --no-conversation \
+              >"$output" 2>"$diagnostics"
+            status=$?
+            set -e
+            if test "$status" -ne 0; then
+              echo "Native inference attempt $attempt failed (exit $status); no unsandboxed fallback"
+              sed -n '1,50p' "$diagnostics"
+              exit "$status"
+            fi
+            test -s "$output"
+            if ! grep -Eiq '(^|[^[:alpha:]])Paris([^[:alpha:]]|$)' "$output"; then
+              echo "SEMANTIC FAIL: expected Paris in the model response (attempt $attempt)"
+              head -c 220 "$output"
+              exit 1
+            fi
+            echo "Native attempt $attempt semantic PASS; bytes: $(wc -c < "$output")"
+            sha256sum "$output"
+          done
+          if ! cmp -s "$RUNNER_TEMP/veda-native-output-1.txt" "$RUNNER_TEMP/veda-native-output-2.txt"; then
+            echo "REPRODUCIBILITY FAIL: output differs despite deterministic settings"
             exit 1
           fi
-          echo "Native GGUF E2E PASS: sandboxed CPU inference emitted output."
-          echo "Output bytes: $(wc -c < "$output")"
-          echo "No content uploaded; local temporary files expire with runner."
+          echo "NATIVE GGUF HARDENING PASS: semantic=Paris, reproducibility=identical 2/2, sandbox=isolated"
+          {
+            echo '## VEDA G1 Native GGUF Hardening (model-check only)'
+            echo '| Check | Result |'
+            echo '|---|---|'
+            echo '| Isolated bubblewrap sandbox | PASS |'
+            echo '| Model SHA-256 | PASS |'
+            echo '| Semantic answer: Paris | PASS |'
+            echo '| Deterministic outputs (2/2) | PASS |'
+            echo '| Trust G0 | HOLD (unchanged) |'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report reproducibility pins (even on failure)
         if: always()
