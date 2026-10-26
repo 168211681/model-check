@@ -1,11 +1,6 @@
 name: "VEDA G1.6 Combined Runtime Capability Read-only Probe"
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/veda-g16-combined-runtime-probe.yml
 permissions:
   contents: read
 jobs:
