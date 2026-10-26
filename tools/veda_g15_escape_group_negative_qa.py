@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded negative test for detached children escaping group-only supervision.
+"""Regression test for bounded children that escape the original process group.
 
 This test MUST NOT be interpreted as a successful process-tree enforcement test.
 Runs only with disposable Bubblewrap PID/mount/network isolation and short-lived
@@ -42,17 +42,17 @@ def negative_probe():
     pid = int(MARKER.read_text(encoding="ascii"))
     record = _stat(pid)
     detached_alive = record is not None and record[0] != "Z"
-    # The current G1.5 baseline reports success for the original worker, not
-    # for any detached child. This diagnostic proves whether that is unsafe.
+    # Regression: the hardened supervisor must fail closed on detached children.
     print(f"ESCAPE_PROBE supervisor_decision={outcome['decision']} "
           f"group_remaining={outcome['alive_group_after']} "
           f"detached_pid={pid} detached_alive={detached_alive}", flush=True)
     try:
-        if detached_alive and outcome["decision"] == "exit_0" and outcome["alive_group_after"] == 0:
-            print("ESCAPE_NEGATIVE_TEST_REPRODUCED: detached child survived supervisor success.", flush=True)
-            print("G1.5 SECURITY GATE: HOLD; no release or governance change.", flush=True)
-            return 0
-        raise AssertionError("escape condition not reproduced; inspect actual process lineage")
+        assert outcome["decision"] == "orphan_descendants", f"detached child not recognized: {outcome}"
+        assert outcome["alive_group_after"] == 0, f"descendant cleanup failed: {outcome}"
+        assert not detached_alive, "detached child survived after supervisor exit"
+        print("ESCAPE_REGRESSION_PASS: subreaper recognized and terminated detached child.", flush=True)
+        print("G1.5 SECURITY: bounded escape regression PASS; kernel cgroup remains HOLD.", flush=True)
+        return 0
     finally:
         if detached_alive:
             try:
